@@ -213,7 +213,7 @@ class demand_class:
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]  
             elif example_demand == "Amsterdam":
-                path = r'C:\Users\6100430\OneDrive - Universiteit Utrecht\PhD project\PhD python\Warmtevraag_Amsterdam_50GWh_parquet'
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Amsterdam_50_GWh_parquet'
                 excel_file = pd.read_parquet(path)
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]  
