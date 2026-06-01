@@ -735,8 +735,8 @@ class ATES_obj:
                         count_diff = count_diff-int(np.round(count_diff*(1-factor)))
 
                         if self.HP != None:
-                            energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 
-                            + self.HP.delta_T_coldside*max_flow_generated/(self.HP.COP[t]-1)*self.density*self.heat_cap/3600000 #kWh
+                            energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000
+                            + self.HP.delta_T_coldside*max_flow_generated/(self.HP.COP[t]-1)*self.density*self.heat_cap/3600000 #kWh #P: Why is the COP inserted here?  delta_T_coldside · flow / (COP−1) · ρcₚ = W (electrical work); in main file the thermal energy is used
                         else:
                             energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 
                         factor = missing_energy[t]/energy_generated
@@ -802,27 +802,27 @@ class ATES_obj:
     def re_add_data_point(self):
         self.data = pd.concat([self.data,self.store_data])
         self.data.sort_index(inplace=True)
-        
-        
-        
-        
-  
+
+
+
+
+
 if __name__ == "__main__":
-    
+
     #Parameters
     thickness_aquifer = 50 #[m] Thickness of the aquifer (assuming homogenous and constant thickness)
     porosity = 0.2 #[-] porosity aquifer
     horizontal_conductivity = 5  #[m day^-1] Horizontal hydraulic conductivity
     anisotropy =1 #[-] Horizontal hydraulic conductivity/vertical hydraulic conductivity
     ground_temperature = 25 #[degrees C] Undisturbed ground temperature
-    supplier = 0 
+    supplier = 0
     time_sum=0
     start_total=time.time()
     for i in range(10):
         start = time.time()
-        ATES = ATES_obj(supplier, max_V = 100,thickness=thickness_aquifer, porosity=porosity,kh=horizontal_conductivity, 
+        ATES = ATES_obj(supplier, max_V = 100,thickness=thickness_aquifer, porosity=porosity,kh=horizontal_conductivity,
                         ani=anisotropy,T_ground=ground_temperature)
-        
+
         Volume =403680 #m^3/year, volume injected as well as extracted (assuming mass balance needs to be preserved)
         Temp_in = 90 #[degrees C] Temperature of the water going in the aquifer
         ATES.initialize(Volume, Temp_in, 3600) #Generates values for T_out
@@ -830,8 +830,8 @@ if __name__ == "__main__":
     print("Time taken per thing",(time.time()-start_total)/50)
     plt.plot(ATES.output_t.loc[:,"flow"],ATES.output_t.loc[:,"Outlet_T_hotwell"])
     plt.xlabel("Volume (m^3) extracted")
-    plt.ylabel("Temperature out of ATES")   
-    print("Predicted recovery efficiency = ",ATES.Reff) 
+    plt.ylabel("Temperature out of ATES")
+    print("Predicted recovery efficiency = ",ATES.Reff)
     plt.figure(dpi=800)
     plt.plot(np.linspace(0,8,417),ATES.temp_out,label="Well temperature")
     plt.xlabel("Time (years)")
@@ -844,3 +844,49 @@ if __name__ == "__main__":
 
 
     # This is for multiple cycles. Each cycle containing the amount of volume.
+
+
+
+if __name__ == "__main__":
+
+    # --- Aquifer / system parameters ---
+    thickness_aquifer       = 50    # [m]
+    porosity                = 0.2   # [-]
+    horizontal_conductivity = 5     # [m/day]
+    anisotropy              = 1     # [-]
+    ground_temperature      = 25    # [deg C]
+    supplier                = 0
+
+    Volume       = 403680   # [m^3/yr] injected = extracted
+    len_timestep = 3600     # [s]
+
+    ATES = ATES_obj(supplier, max_V=100, thickness=thickness_aquifer,
+                    porosity=porosity, kh=horizontal_conductivity,
+                    ani=anisotropy, T_ground=ground_temperature)
+
+    injection_temps = list(range(50, 19, -5))   # [50,45,40,35,30,25,20]
+    print("Sweep injection temps:", injection_temps, flush=True)
+
+    T_in_arr, T_ave_arr = [], []
+    print(f"\n{'T_inj [C]':>10} | {'avg T_extract [C]':>17}", flush=True)
+    print("-" * 31, flush=True)
+
+    for T_in in injection_temps:
+        ATES.init_cold_well(T_in, Volume)
+        T_in_arr.append(T_in)
+        T_ave_arr.append(ATES.cold_well_T_ave)
+        print(f"{T_in:>10.1f} | {ATES.cold_well_T_ave:>17.2f}", flush=True)
+
+    # --- Visual ---
+    plt.figure(dpi=150)
+    plt.plot(T_in_arr, T_ave_arr, "o-", label="avg cold-well extraction T")
+    plt.axhline(ground_temperature, color="grey", ls="--", alpha=0.6,
+                label="ground temperature")
+    plt.plot(T_in_arr, T_in_arr, color="black", ls=":", alpha=0.4,
+             label="injection = extraction (1:1)")
+    plt.xlabel("Cold-well injection temperature [C]")
+    plt.ylabel("Average cold-well extraction temperature [C]")
+    plt.gca().invert_xaxis()
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
