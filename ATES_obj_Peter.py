@@ -506,255 +506,248 @@ class ATES_obj:
             ValueError("Reff higher than 100%, don't do that")
         self.Reff = Reff
         self.Reff_set = True
-    def calc_heat(self,T_cutoff,T_demand_out, storage_extraction, missing_energy,
-                  HP=None,len_timestep=3600,firstyear=False,control = None):
+    def _energy_split(self, flow_m3, T_mean, T_inj, T_demand_out, hp_running):
+        """
+        Split the heat delivered in one timestep into its physical components.
+
+        flow_m3   : volume extracted this timestep [m3]
+        T_mean    : mean hot-well extraction temperature over the timestep [C]
+        T_inj     : cold-well injection temperature this timestep [C]
+                    (= self.T_return if HP off, = self.T_floor if HP on)
+        Returns (Q_dir, Q_evap, P_el, Q_tot, COP) in kWh.
+        """
+        C_A = flow_m3 * self.density * self.heat_cap / 3.6e6      # [kWh/K]
+
+        # (a) Direct HX: only the part of the ATES water ABOVE the DHN return
+        Q_dir = C_A * max(0.0, T_mean - self.T_return)
+
+        if not hp_running or self.HP is None:
+            return Q_dir, 0.0, 0.0, Q_dir, np.nan
+
+        # (b) HP evaporator: from min(T_mean, T_return) down to the cold-well floor
+        T_evap_in = min(T_mean, self.T_return)
+        Q_evap = C_A * max(0.0, T_evap_in - T_inj)
+        if Q_evap <= 0.0:
+            return Q_dir, 0.0, 0.0, Q_dir, np.nan
+
+        # (c) Compressor work.  Q_cond = Q_evap + W  and  COP = Q_cond / W
+        # P: ToDo Check if implementation of HP with temperatures and everythin is correct
+        # Sensitivity vs David's inlet convention + pinch: revisit later.
+        T_source = 0.5 * (T_evap_in + T_inj)          # mean source T over the evaporator
+        COP = self.HP.Calculate_COP(T_demand_out, T_source) #P: Check if this is necessary (guard on COP < 1), implement decision if C is feasible later
+        #if not np.isfinite(COP) or COP <= 1.05:
+            #return Q_dir, 0.0, 0.0, Q_dir, np.nan  # HP not viable this step
+        P_el = Q_evap / (COP - 1.0)
+
+        return Q_dir, Q_evap, P_el, Q_dir + Q_evap + P_el, COP
+
+    def calc_heat(self, T_cutoff, T_demand_out, storage_extraction, missing_energy,
+                  hp_on=None, hp_override_below_cutoff=True,
+                  HP=None, len_timestep=3600, firstyear=False, control=None):
         """
         Calculates the energy output based on temperature constraints and missing energy.
-       
+
         Parameters
         ----------
         T_cutoff : float
-            Cutoff temperature from the grid.
+            DHN return temperature. Below this the ATES water cannot heat the network
+            passively, so it is both the HX floor and the mode-A injection temperature.
         T_demand_out : float
-            Desired outlet temperature of the grid input.
-        storage_extraction : float
-            Storage extraction input that defines when the ATES system can be on, 
-            assuming you do not want to switch it on/off multiple times.
+            DHN supply temperature (the HP condenser sink).
+        storage_extraction : array
+            Mask defining when the ATES is allowed to run.
         missing_energy : pd.Series
-            Series containing missing energy values.
-        HP : Any, optional
-            Heat pump information. 
+            Heat still to be covered, per timestep [kWh].
+        hp_on : array of bool, optional
+            Per-timestep HP dispatch intent from main2. None -> HP never runs (mode A).
+        hp_override_below_cutoff : bool, optional
+            If True, the ATES forces the HP on whenever the extraction temperature has
+            dropped below T_cutoff (mode D), because the HX can deliver nothing there.
         len_timestep : int, optional
-            Length of each time step in seconds.
+            Length of each timestep in seconds.
         firstyear : bool, optional
             Flag indicating if it's the first year.
-       
+
         Returns
         -------
         np.ndarray
-            Array representing the calculated energy output.
+            Total heat delivered to the DHN per timestep [kWh] (= ATES + HP).
+            The split is stored on the object: output_dir, output_evap, output_HP,
+            P_el, COP, T_extract, T_inject, mode.
+            P: How does this differ from the old version? Does the old version only contain one column, while the new one contains multiple ones and the sum of each row is the total heat delivered per timestep?
         """
         self.len_timestep = len_timestep
-        # Get the max flow and the amount of energy to be filled by ATES
-        max_flow_generated = self.max_V*len_timestep/3600
-        
-        missing_energy = missing_energy*storage_extraction
-        
-        # Initialize flow and output as 0
+        max_flow_generated = self.max_V * len_timestep / 3600
+        missing_energy = missing_energy * storage_extraction
+
+        # --- Result arrays -----------------------------------------------------
+        n = len(missing_energy)
         flow = 0
-        self.flow_extracted = np.zeros(len(missing_energy))
-        output = np.zeros(len(missing_energy))
-        #Heat_generated_HP= np.zeros(len(missing_energy))
-        
-#        self.total_heat_extracted_vs_T_ground_kWh_first_8_years = sum(np.diff(self.output_t.loc[:,"flow"],prepend=0)*(self.output_t["Outlet_T_hotwell"]-T_cutoff)*1000*4186/3600000)
-        self.total_heat_extracted_vs_T_ground_kWh_first_8_years=np.zeros(8)
-        difference = (self.output_t.loc[:,"Outlet_T_hotwell"]-T_cutoff)
-        difference[difference<0]=0
-        #Calculate the heat output of the first 8 years of the hot well based on the difference with the output temperature of the heat network
+        #P: What is all this done for?
+        output              = np.zeros(n)   # total heat to the DHN [kWh]
+        self.flow_extracted = np.zeros(n)
+        self.output_dir     = np.zeros(n)   # ATES via HX
+        self.output_evap    = np.zeros(n)   # ATES via HP source side
+        self.output_HP      = np.zeros(n)   # HP condenser output = evap + P_el
+        self.P_el           = np.zeros(n)   # compressor electricity
+        self.COP            = np.full(n, np.nan)
+        self.T_extract      = np.zeros(n)   # realized mean extraction T
+        self.T_inject       = np.full(n, float(T_cutoff))   # realized cold-well injection T
+        self.mode           = np.full(n, 'off', dtype=object)
+
+        # --- 8-year extractable-heat accounting (unchanged, feeds LCOH) --------
+        # NOTE: measured against the un-lowered T_cutoff. Conservative when the HP runs. (Check P)
+        self.total_heat_extracted_vs_T_ground_kWh_first_8_years = np.zeros(8)
+        difference = (self.output_t.loc[:, "Outlet_T_hotwell"] - T_cutoff)
+        difference[difference < 0] = 0
+        # Calculate the heat output of the first 8 years of the hot well based on the difference with the output temperature of the heat network
         for i in range(8):
             self.total_heat_extracted_vs_T_ground_kWh_first_8_years[i] = \
-                sum(np.diff(self.output_t.loc[(i)*8736*self.elongation_constant:(i+1)*8736*self.elongation_constant-1,"flow"],\
-                            prepend=min(self.output_t.loc[(i)*8736*self.elongation_constant:(i+1)*8736*self.elongation_constant-1,"flow"]))\
-                    *(difference[(i)*8736*self.elongation_constant:(i+1)*8736*self.elongation_constant])*1000*4186/3600000)
-                    
-        # Find the starting temperature of the ATES is on removing any unnecessary numbers from the flow.
-        try:
-            T_start = max(self.output_t_lastyear["Outlet_T_hotwell"]*(self.output_t_lastyear["flow"]>0))
-        except:
-            x = 5
-       
-        if min(self.output_t_lastyear["Outlet_T_hotwell"])>T_cutoff:
-            if self.HP != None:
-                print("Heat pump not necessary for boosting ATES temperature: used for direct heating of return temperature, please consider the feasibility of this")
-            
-        #Initialize the heat pump                
-        if self.HP!=None:
-            self.HP.COP = np.zeros(len(missing_energy))
-            T_cutoff=T_cutoff-self.HP.delta_T_coldside
-        
-        # Iterate over the missing energy, start at halfway through year (after summer) done by changing index
-        
-        index = missing_energy[missing_energy>0]
-        index1 = index.where(index.index>np.mean(missing_energy.index)).dropna()
-        index2 = index.where(index.index<=np.mean(missing_energy.index)).dropna()
-        index = pd.concat([index1,index2])
-        count = 0
+                sum(np.diff(self.output_t.loc[(i)*8736*self.elongation_constant:(i+1)*8736*self.elongation_constant-1, "flow"],
+                            prepend=min(self.output_t.loc[(i)*8736*self.elongation_constant:(i+1)*8736*self.elongation_constant-1, "flow"]))
+                    * (difference[(i)*8736*self.elongation_constant:(i+1)*8736*self.elongation_constant]) * 1000*4186/3600000)
+
+        # --- Starting hot-well temperature ------------------------------------- (P: What is done here? Old comment:# Find the starting temperature of the ATES is on removing any unnecessary numbers from the flow.
+        """try:
+            T_start = max(self.output_t_lastyear["Outlet_T_hotwell"] * (self.output_t_lastyear["flow"] > 0))
+        except Exception:
+            T_start = T_cutoff #P: What is this?"""
+        # Starting hot-well temperature: warmest point of the last-year curve with positive flow.
+        masked_T = self.output_t_lastyear["Outlet_T_hotwell"] * (self.output_t_lastyear["flow"] > 0)
+        if len(masked_T) and masked_T.max() > 0:
+            T_start = masked_T.max()
+
+        else:
+            print("Warning: no positive-flow extraction curve; T_start set to T_cutoff")
+            T_start = T_cutoff
+
+        if min(self.output_t_lastyear["Outlet_T_hotwell"]) > T_cutoff: #P: is this msg neccessary?
+            if self.HP is not None:
+                print("Heat pump not necessary for boosting ATES temperature: used for "
+                      "direct heating of return temperature, please consider the feasibility of this")
+
+        # --- Temperature levels (set once, never mutated) -----------------------
+        self.T_return = T_cutoff                                    # HX floor
+        if self.HP is not None:
+            self.T_floor = max(T_cutoff - self.HP.delta_T_coldside, self.T_g)
+            if T_cutoff - self.HP.delta_T_coldside < self.T_g:
+                print(f"Warning: HP floor below ground temperature; clipped to T_g = {self.T_g}")
+        else:
+            self.T_floor = T_cutoff                                 # no HP -> nothing below the return
+
+        # --- HP dispatch intent from main2 --------------------------------------
+        if hp_on is None or self.HP is None:
+            hp_on = np.zeros(n, dtype=bool)
+        else:
+            if len(hp_on) != n:
+                raise ValueError("hp_on must be one value per timestep")
+            hp_on = np.asarray(hp_on).astype(bool)
+
+        # Backward compatibility: old main2 reads storage_obj.HP.COP
+        if self.HP is not None:
+            self.HP.COP = self.COP
+
+        # --- Iterate, starting halfway through the year (after summer) ----------
+        index = missing_energy[missing_energy > 0]
+        index1 = index.where(index.index > np.mean(missing_energy.index)).dropna()
+        index2 = index.where(index.index <= np.mean(missing_energy.index)).dropna()
+        index = pd.concat([index1, index2])
+
         if control == "Peak shaving":
-            usefull_volume = self.output_t_lastyear[self.output_t_lastyear.Outlet_T_hotwell<T_cutoff-1].flow.iloc[0]
-            #peak_shaving_control = self.volume/sum(np.clip(missing_energy,a_min=0,a_max=None))*np.clip(missing_energy,a_min=0,a_max=None)
-            peak_shaving_control = usefull_volume/sum(np.clip(missing_energy,a_min=0,a_max=None))*np.clip(missing_energy,a_min=0,a_max=None)
+            usefull_volume = self.output_t_lastyear[self.output_t_lastyear.Outlet_T_hotwell < T_cutoff-1].flow.iloc[0]
+            peak_shaving_control = usefull_volume / sum(np.clip(missing_energy, a_min=0, a_max=None)) \
+                                   * np.clip(missing_energy, a_min=0, a_max=None)
             rest = 0
-            for i,ele in enumerate(peak_shaving_control):
+            for i, ele in enumerate(peak_shaving_control):
                 if i == len(peak_shaving_control)-1:
                     break
                 elif peak_shaving_control[i] > max_flow_generated:
-                    rest = peak_shaving_control[i]-max_flow_generated
-                    peak_shaving_control[i]=max_flow_generated
-                    peak_shaving_control[i+1]=peak_shaving_control[i+1]+rest
+                    rest = peak_shaving_control[i] - max_flow_generated
+                    peak_shaving_control[i] = max_flow_generated
+                    peak_shaving_control[i+1] = peak_shaving_control[i+1] + rest
                     rest = 0
             if rest != 0:
-                peak_shaving_control[0]=peak_shaving_control[0]+rest
-        
-        # max_diff_flow = np.nanmax(self.output_t_lastyear["flow"].diff())
-        max_flow = (self.output_t_lastyear["flow"].iloc[-1])
-        # min_index = min(self.output_t_lastyear.index)
+                peak_shaving_control[0] = peak_shaving_control[0] + rest
+
+        max_flow  = self.output_t_lastyear["flow"].iloc[-1]
+        flow_vals = self.output_t_lastyear["flow"].values
+        T_vals    = self.output_t_lastyear["Outlet_T_hotwell"].values
+        n_curve   = len(T_vals)
+
         for t in index.index:
+
+            # ---- 1. Pick the trial flow and the resulting end-of-step temperature ---- #P: Peak shaving still buggy
             if control == "Peak shaving":
-                max_flow_generated=peak_shaving_control[t]
-                target_flow = max_flow_generated+flow
-                T_after = self.output_t_lastyear.loc[abs((self.output_t_lastyear['flow']-(target_flow))).idxmin()]
-                T_after = T_after["Outlet_T_hotwell"]
-                
-                # Calculate the energy generated
-                energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 #kWh
-                
-                #Check which mode the HP is on. We want the smallest temperature difference in the heat pump
-                if self.HP != None:
-                    if (T_after+T_start)/2<T_cutoff+self.HP.delta_T_coldside:
-                        Tsupply = T_demand_out
-                        Tsource = (T_after+T_start)/2
-                    elif (T_after+T_start)/2>=T_cutoff+self.HP.delta_T_coldside:
-                        Tsupply = T_demand_out
-                        Tsource = T_cutoff+self.HP.delta_T_coldside
-                    self.HP.COP[t] = self.HP.Calculate_COP(Tsupply, Tsource)
-                    energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 
-                    + self.HP.delta_T_coldside*max_flow_generated/(self.HP.COP[t]-1)*self.density*self.heat_cap/3600000 #kWh
-                
-                #Check if energy is negative and prevent that
-                if energy_generated<0:
-                    energy_generated=0
-                    max_flow_generated = 0
-                
-                #Check that we are not fully using the heat pump to boost temperature to unusable temperatuer
-                if self.HP != None:
-
-                    if T_after < T_cutoff+0.5*self.HP.delta_T_coldside:
-                        energy_generated = 0 
-                        max_flow_generated = 0
-                   
-                # Check if enough (and not too much) energy is generated
-                if energy_generated <= missing_energy[t]:
-                    output[t]= energy_generated
-                
-                # if too much energy is generated adjust the flow out
-                elif energy_generated > missing_energy[t]:
-                    factor = missing_energy[t]/energy_generated
-                    
-                    # Keep iterating, to find the needed flow
-                    while energy_generated > missing_energy[t]*1.005 or factor >1.05:
-                        max_flow_generated = max_flow_generated *factor
-                        T_after = self.output_t_lastyear.loc[abs((self.output_t_lastyear['flow']-(max_flow_generated+flow))).idxmin()]
-                        T_after = T_after["Outlet_T_hotwell"]
-                        if self.HP != None:
-                            energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 
-                            + self.HP.delta_T_coldside*max_flow_generated/(self.HP.COP[t]-1)*self.density*self.heat_cap/3600000 #kWh
-                        else:
-                            energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 
-                        factor = missing_energy[t]/energy_generated
-
-                    #Save the output        
-                self.flow_extracted[t]=max_flow_generated
-                output[t] = energy_generated
-                
-                #Set everything for next iteration                   
-                T_start = T_after
-                flow = flow + max_flow_generated
-                max_flow_generated = self.max_V*len_timestep/3600
-                
-                
+                max_flow_generated = peak_shaving_control[t]
             else:
-                # Adjust the maximum flow rate if it exceeds the available volume ATES 
                 if max_flow_generated + flow > max_flow:
-                    max_flow_generated = self.output_t_lastyear["flow"].iloc[-1] - flow
-                    if max_flow_generated<0:
-                        max_flow_generated=0
-                
-                
-                # Get the temperature after the specified maximum flow this is an approximation
-                closest_ind = bisect_left(self.output_t_lastyear["flow"].values, max_flow_generated+flow)
-                #closest_ind = get_closests(self.output_t_lastyear, "flow", max_flow_generated+flow)
-                
-                T_after = self.output_t_lastyear["Outlet_T_hotwell"].iat[closest_ind]
-                #T_after = self.output_t_lastyear.iloc[(self.output_t_lastyear['flow']-(max_flow_generated+flow)).abs().argsort()[:1]]
-                # T_after = T_after["Outlet_T_hotwell"].iloc[0]
-                #exceed_flow = -1
-                target_flow = max_flow_generated+flow
-                count_diff = closest_ind-count
-                count = closest_ind
+                    max_flow_generated = max(0.0, max_flow - flow)
 
+            idx = min(bisect_left(flow_vals, max_flow_generated + flow), n_curve - 1)
+            T_after = T_vals[idx]
 
-                
-                # Calculate the energy generated
-                energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 #kWh
-                
-                #Check which mode the HP is on. We want the smallest temperature difference in the heat pump
-                if self.HP != None:
-                    if (T_after+T_start)/2<T_cutoff+self.HP.delta_T_coldside:
-                        Tsupply = T_demand_out
-                        Tsource = (T_after+T_start)/2
-                    elif (T_after+T_start)/2>=T_cutoff+self.HP.delta_T_coldside:
-                        Tsupply = T_demand_out
-                        Tsource = T_cutoff+self.HP.delta_T_coldside
-                    self.HP.COP[t] = self.HP.Calculate_COP(Tsupply, Tsource)
-                    energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 
-                    + self.HP.delta_T_coldside*max_flow_generated/(self.HP.COP[t]-1)*self.density*self.heat_cap/3600000 #kWh
-                
-                #Check if energy is negative and prevent that
-                if energy_generated<0:
-                    energy_generated=0
-                    max_flow_generated = 0
-                
-                #Check that we are not fully using the heat pump to boost temperature to unusable temperatuer
-                if self.HP != None:
+            # ---- 2. Decide the HP state for this hour --------------------------------
+            T_mean = 0.5 * (T_after + T_start)
+            hp_running = bool(hp_on[t])
 
-                    if T_after < T_cutoff+0.5*self.HP.delta_T_coldside:
-                        energy_generated = 0 
-                        max_flow_generated = 0
-                    # Check if enough (and not too much) energy is generated
-                if energy_generated <= missing_energy[t]:
-                    output[t]= energy_generated
-                
-                # if too much energy is generated adjust the flow out
-                elif energy_generated > missing_energy[t]:
-                    factor = missing_energy[t]/energy_generated
-                    
-                    # Keep iterating, to find the needed flow
-                    while energy_generated > missing_energy[t]*1.005:
-                        if factor>1:
-                            x = 5
-                            break
-                        max_flow_generated = max_flow_generated *factor
-                        new_loc =count - int(np.round(count_diff*(1-factor)))
-                        if new_loc<0:
-                            x=0
-                        try:
-                            T_after = self.output_t_lastyear["Outlet_T_hotwell"].iat[closest_ind]
-                        except:
-                            x = 5
-                        count = new_loc
-                        count_diff = count_diff-int(np.round(count_diff*(1-factor)))
+            # Mode-D override: below the DHN return the HX delivers nothing, so the HP
+            # is the only way to get heat out. The ATES overrules main2.
+            if (self.HP is not None and hp_override_below_cutoff
+                    and T_mean < self.T_return):
+                hp_running = True
 
-                        if self.HP != None:
-                            energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000
-                            + self.HP.delta_T_coldside*max_flow_generated/(self.HP.COP[t]-1)*self.density*self.heat_cap/3600000 #kWh #P: Why is the COP inserted here?  delta_T_coldside · flow / (COP−1) · ρcₚ = W (electrical work); in main file the thermal energy is used
-                        else:
-                            energy_generated = max_flow_generated*((T_after+T_start)/2-T_cutoff)*self.density*self.heat_cap/3600000 
-                        factor = missing_energy[t]/energy_generated
-                    #Save the output
-                self.flow_extracted[t]=max_flow_generated
-                output[t] = energy_generated
-                
-                #Set everything for next iteration                   
-                T_start = T_after
-                flow = flow + max_flow_generated
-                max_flow_generated = self.max_V*len_timestep/3600
+            T_inj = self.T_floor if hp_running else self.T_return
 
-                    
+            # ---- 3. Heat for the trial flow ------------------------------------------- #P: What trial flow?
+            Q_dir, Q_evap, P_el, energy_generated, COP = self._energy_split(
+                max_flow_generated, T_mean, T_inj, T_demand_out, hp_running)
 
-        self.flow_extracted=np.clip(self.flow_extracted, a_min=0,a_max=None)   
-        # Return output
-        #output = np.clip(output, a_min = 0, a_max=None)
+            # ---- 4. Well depleted for this mode? -------------------------------------- #P: What is this?
+            if energy_generated <= 0.0:
+                max_flow_generated = self.max_V * len_timestep / 3600
+                continue                      # no flow, do NOT advance T_start
+
+            # ---- 5. Don't over-deliver: shrink the flow to match missing_energy -------- #P: Why should energy generated be too big in the first place? What does this do
+            if energy_generated > missing_energy[t]:
+                for _ in range(20):
+                    factor = missing_energy[t] / energy_generated
+                    if 0.995 <= factor <= 1.0:
+                        break
+                    max_flow_generated *= factor
+                    idx = min(bisect_left(flow_vals, max_flow_generated + flow), n_curve - 1)
+                    T_after = T_vals[idx]
+                    T_mean = 0.5 * (T_after + T_start)
+                    Q_dir, Q_evap, P_el, energy_generated, COP = self._energy_split(
+                        max_flow_generated, T_mean, T_inj, T_demand_out, hp_running)
+                    if energy_generated <= 0.0:
+                        break
+                if energy_generated <= 0.0:
+                    max_flow_generated = self.max_V * len_timestep / 3600
+                    continue
+
+            # ---- 6. Store --------------------------------------------------------------
+            hp_active = (Q_evap > 0.0)
+
+            self.flow_extracted[t] = max_flow_generated
+            self.output_dir[t]     = Q_dir
+            self.output_evap[t]    = Q_evap
+            self.output_HP[t]      = Q_evap + P_el
+            self.P_el[t]           = P_el
+            self.COP[t]            = COP
+            self.T_extract[t]      = T_mean
+            self.T_inject[t]       = T_inj if hp_active else self.T_return
+            self.mode[t] = ('A' if not hp_active
+                            else ('B' if T_mean >= self.T_return else 'D'))
+            output[t] = energy_generated
+
+            # ---- 7. Advance ------------------------------------------------------------
+            T_start = T_after
+            flow   += max_flow_generated
+            max_flow_generated = self.max_V * len_timestep / 3600
+
+        self.flow_extracted = np.clip(self.flow_extracted, a_min=0, a_max=None)
         return output
+
     def Thiem_equation(self):
         rw=0.3
         flow = self.flow_extracted+self.flow_injected
