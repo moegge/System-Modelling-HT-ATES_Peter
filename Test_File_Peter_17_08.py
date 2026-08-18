@@ -1,21 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Test_File_Peter_HPon.py
+Test_File_Peter_17_08.py
 ==================================================================
-One simulation of the updated model (main2_Peter / ATES_obj_Peter) with the
-heat pump ON at all times -- i.e. active on EVERY discharge hour.
+One simulation of the updated model (main2_Peter / ATES_obj_Peter), wrapped in
+run_case() so it can be run directly (single run) OR imported and called from a
+sweep script (see sweep.py).
+
+Toggle use_hp selects between two configurations:
+  * use_hp = True  -> heat pump on the ATES discharge side, active on EVERY
+                      discharge hour (mode B above the return temperature,
+                      mode D below it). No HP object is created when False.
+  * use_hp = False -> NO heat-pump object is attached to the ATES at all.
+                      This is a clean baseline equivalent to the original model:
+                      calc_heat's mode-D override is guarded by 'self.HP is not
+                      None', so with no HP nothing can turn it on.
 
 Why "all times" == "every discharge hour": in calc_heat the loop only visits
 timesteps where missing_energy > 0 (the ATES is being drawn on), and the whole
 HP dispatch + output lives inside that loop. On charging/surplus hours the HP
 code is never reached, so hp_on there does nothing. Charge-side HP is not
 implemented. Passing hp_on = all True therefore runs the HP on every discharge
-hour (mode B above the return temperature, mode D below it).
+hour.
 
 Run from the repo root (needs main2_Peter.py, ATES_obj_Peter.py, results_AXI_V2,
 Predict_REFF_boostedregression.pkl, and the Amsterdam demand parquet).
 
-    python Test_File_Peter_HPon.py
+    python Test_File_Peter_17_08.py            # single run, plots + Excel
+    from Test_File_Peter_17_08 import run_case  # driven by sweep.py
 ==================================================================
 """
 
@@ -27,34 +38,104 @@ from main2_Peter import (geothermal, demand_class, gas_boiler, heat_pump_ATES,
                          system, economic_analysis, system_plot, CO2_emissions_calc)
 from ATES_obj_Peter import ATES_obj
 
-if __name__ == "__main__":
+# ================================================================== #
+#  DEFAULT CONFIGURATION  --  the single-run defaults.               #
+#  A sweep overrides any of these by passing them to run_case().     #
+# ================================================================== #
 
-    timestep = 3600  # [s]
+# --- Master toggle: run WITH or WITHOUT the discharge-side heat pump -------
+USE_HP = True            # True  -> HP created and attached to the ATES
+                         # False -> NO HP object created at all (clean baseline)
 
-    # --- District-heating components (same setup as the example script) --------
-    demand = demand_class(T_in=75, T_out=55, example_demand="Amsterdam")
+# --- Simulation ------------------------------------------------------------
+TIMESTEP = 3600          # [s]
+
+# --- District-heating demand ----------------------------------------------
+DEMAND_EXAMPLE = "Amsterdam"
+DEMAND_T_IN    = 75      # [C] DHN supply temperature (HP condenser sink)
+DEMAND_T_OUT   = 55      # [C] DHN return temperature (= ATES cutoff / HX floor)
+
+# --- Geothermal baseload (also the ATES charging source) ------------------
+GEO_POWER = 5000         # [kW]
+GEO_T_OUT = 75           # [C]
+
+# --- ATES aquifer ----------------------------------------------------------
+ATES_MAX_V     = 300     # [m3/h]
+ATES_THICKNESS = 40      # [m]
+ATES_KH        = 5       # [m/day]
+ATES_ANI       = 4       # [-]
+ATES_T_GROUND  = 15      # [C]
+
+# --- Heat pump (only used if USE_HP is True) -------------------------------
+HP_POWER_EL         = 1500   # [kW_el] fixed compressor rating
+HP_DELTA_T_COLDSIDE = 20     # [K] cooling below the DHN return -> fixed cold-well T
+
+# --- CO2 price for the economics -------------------------------------------
+CO2_PRICE = 70           # [euro/ton]
+
+# ================================================================== #
+
+
+def run_case(USE_HP=USE_HP, TIMESTEP=TIMESTEP,
+             DEMAND_EXAMPLE=DEMAND_EXAMPLE, DEMAND_T_IN=DEMAND_T_IN, DEMAND_T_OUT=DEMAND_T_OUT,
+             GEO_POWER=GEO_POWER, GEO_T_OUT=GEO_T_OUT,
+             ATES_MAX_V=ATES_MAX_V, ATES_THICKNESS=ATES_THICKNESS, ATES_KH=ATES_KH,
+             ATES_ANI=ATES_ANI, ATES_T_GROUND=ATES_T_GROUND,
+             HP_POWER_EL=HP_POWER_EL, HP_DELTA_T_COLDSIDE=HP_DELTA_T_COLDSIDE,
+             CO2_PRICE=CO2_PRICE,
+             OUTFILE=None, tag="",
+             make_plots=False, write_excel=True):
+    """
+    Run one configuration. Any argument left at its default reproduces the
+    single-run config; a sweep passes only the knobs it varies.
+
+    OUTFILE     : Excel path. None -> auto 'timeseries_HPon[/off][_tag].xlsx'.
+    tag         : suffix on the auto filename so sweep runs don't overwrite.
+    make_plots  : show the two system_plot figures (keep False in a sweep).
+    write_excel : write the 5-sheet workbook (False in a sweep that only wants
+                  the returned numbers).
+
+    Returns a dict of headline results so a sweep can collect rows.
+    """
+
+    # --- Output filename (auto-suffixed by config) -----------------------------
+    if OUTFILE is None:
+        OUTFILE = f"timeseries_{'HPon' if USE_HP else 'HPoff'}{('_' + tag) if tag else ''}.xlsx"
+
+    timestep = TIMESTEP
+
+    # --- District-heating components ------------------------------------------
+    demand = demand_class(T_in=DEMAND_T_IN, T_out=DEMAND_T_OUT,
+                          example_demand=DEMAND_EXAMPLE)
     gas    = gas_boiler()
-    geo    = geothermal(power=5000, T_out=75)
+    geo    = geothermal(power=GEO_POWER, T_out=GEO_T_OUT)
 
-    # --- Heat pump on the ATES discharge side ----------------------------------
+    # --- Heat pump on the ATES discharge side (only if enabled) ---------------
     # power_el = compressor rating [kW_el]; delta_T_coldside = cooling below the
-    # DHN return [K]. Both fixed -> constant COP. Tweak to taste.
-    hp = heat_pump_ATES(power_el=1500, delta_T_coldside=20)
+    # DHN return [K]. Both fixed -> constant COP.
+    if USE_HP:
+        hp = heat_pump_ATES(power_el=HP_POWER_EL, delta_T_coldside=HP_DELTA_T_COLDSIDE)
+    else:
+        hp = None            # NO heat-pump object is created at all
 
-    ATES = ATES_obj([geo], max_V=300, thickness=40, kh=5, ani=4, T_ground=15, HP=hp)
+    ATES = ATES_obj([geo], max_V=ATES_MAX_V, thickness=ATES_THICKNESS,
+                    kh=ATES_KH, ani=ATES_ANI, T_ground=ATES_T_GROUND, HP=hp)
 
     # Preferred order for plotting: sustainable source, storage, back-up.
     supply = [geo, ATES, gas]
 
     # --- HP dispatch: ON every hour (only the discharge hours actually use it) --
-    hp_on = np.ones(len(demand.data), dtype=bool)
+    # With no HP, hp_on=None -> calc_heat keeps the HP off and the mode-D override
+    # is itself guarded by 'self.HP is not None', so nothing can turn it on.
+    hp_on = np.ones(len(demand.data), dtype=bool) if USE_HP else None
 
     # --- Run the simulation ----------------------------------------------------
     result, df_flow = system(demand, supply, len_timestep=timestep, hp_on=hp_on)
 
     # --- Plots -----------------------------------------------------------------
-    system_plot(result, supply, demand, len_timestep=timestep, setting="demand_met")
-    system_plot(result, supply, demand, len_timestep=timestep, setting="ordered")
+    if make_plots:
+        system_plot(result, supply, demand, len_timestep=timestep, setting="demand_met")
+        system_plot(result, supply, demand, len_timestep=timestep, setting="ordered")
 
     # --- Economics (LCOH per component) ----------------------------------------
     df_eco = economic_analysis(result, supply, incorporate_CO2=True)
@@ -68,7 +149,8 @@ if __name__ == "__main__":
     cop_active = cop[np.isfinite(cop) & (cop > 0)] if cop.size else np.array([])
     mean_cop = float(cop_active.mean()) if cop_active.size else np.nan
 
-    print("\nHeat-pump summary (HP on every discharge hour):")
+    print("\nHeat-pump summary (HP on every discharge hour):" if USE_HP
+          else "\nBaseline summary (no heat pump):")
     print(f"  HP condenser (Q_evap+P_el)      : {np.nansum(getattr(ATES, 'output_HP', 0.0)) / GWh:8.3f} GWh")
     print(f"  HP electricity  (P_el)          : {np.nansum(getattr(ATES, 'P_el', 0.0)) / GWh:8.3f} GWh")
     print(f"  ATES subsystem (direct+HP)      : {result['ATES production'].sum() / GWh:8.3f} GWh")
@@ -221,8 +303,8 @@ if __name__ == "__main__":
     # --- Economics: pull the key numbers out of df_eco -------------------------
     # df_eco (from economic_analysis above, incorporate_CO2=True) has per-component
     # capex, opex (CO2 cost already folded in), generated-discounted and LCOE.
-    # NOTE: the HP's own capex/opex are folded INTO the ATES row by
-    # economic_analysis -> the HP-detail rows below are broken out separately for
+    # NOTE: with the HP enabled, the HP's own capex/opex are folded INTO the ATES
+    # row by economic_analysis -> the HP-detail rows below are broken out for
     # visibility and are already counted inside the ATES component figures.
     hp_obj         = getattr(ATES, "HP", None)
     P_el_total_kWh = float(np.nansum(getattr(ATES, "P_el", 0.0)))
@@ -234,7 +316,7 @@ if __name__ == "__main__":
     hp_elec_cost   = P_el_total_kWh * hp_elec_price     if hp_obj is not None else 0.0
 
     try:
-        co2_df = CO2_emissions_calc(result, supply, CO2_price=70)
+        co2_df = CO2_emissions_calc(result, supply, CO2_price=CO2_PRICE)
     except Exception as e:
         print(f"(CO2 breakdown skipped: {type(e).__name__}: {e})")
         co2_df = None
@@ -253,6 +335,19 @@ if __name__ == "__main__":
         "CO2 [t/yr]":                 [_co2_kg(k) / 1000 for k in df_eco.index],
         "CO2 cost [euro/yr]":         [_co2_eur(k) for k in df_eco.index],
     })
+
+    # --- Heat-pump broken out as its own row (for visibility) ------------------
+    if hp_obj is not None:
+        hp_row = pd.DataFrame([{
+            "Component": "Heat pump (in ATES)",
+            "CAPEX [Meuro]": hp_capex_eur / 1e6,
+            "OPEX (incl. CO2) [Meuro/yr]": (hp_elec_cost + hp_fixopex_eur) / 1e6,
+            "Generated discounted [GWh]": np.nan,
+            "LCOH [euro/kWh]": np.nan,
+            "CO2 [t/yr]": np.nan,
+            "CO2 cost [euro/yr]": np.nan,
+        }])
+        eco_tbl = pd.concat([eco_tbl, hp_row], ignore_index=True)
 
     # System LCOH: generation-weighted blend of the component LCOHs (approximate;
     # the rigorous system figure is LCOE_calc_Yang, not called here).
@@ -326,52 +421,57 @@ if __name__ == "__main__":
         ],
     })
 
-    with pd.ExcelWriter("timeseries_HPon.xlsx", engine="openpyxl") as writer:
-        ts.to_excel(writer, sheet_name="Per-source heat", index=False)
+    if write_excel:
+        with pd.ExcelWriter(OUTFILE, engine="openpyxl") as writer:
+            ts.to_excel(writer, sheet_name="Per-source heat", index=False)
 
-        params = pd.DataFrame({
-            "Parameter": [
-                "DHN supply T_in [C]", "DHN return T_out [C]",
-                "ATES T_return / HX floor [C]", "ATES T_floor / HP cold side [C]",
-                "Ground temp T_g [C]", "Recovery efficiency Reff [-]",
-                "Annual injected volume [m3]", "max_V [m3/h]",
-                "HP power_el [kW]", "HP delta_T_coldside [K]",
-                "HP COP_max [-]", "HP elec_price [euro/kWh]",
-            ],
-            "Value": [
-                demand.T_in, demand.T_out,
-                getattr(ATES, "T_return", demand.T_out),
-                getattr(ATES, "T_floor", np.nan),
-                ATES.T_g, getattr(ATES, "Reff", np.nan),
-                getattr(ATES, "volume", np.nan), ATES.max_V,
-                hp.power_el, hp.delta_T_coldside, hp.COP_max, hp.elec_price,
-            ],
-        })
-        params.to_excel(writer, sheet_name="Parameters", index=False)
+            params = pd.DataFrame({
+                "Parameter": [
+                    "Configuration (USE_HP)",
+                    "DHN supply T_in [C]", "DHN return T_out [C]",
+                    "ATES T_return / HX floor [C]", "ATES T_floor / HP cold side [C]",
+                    "Ground temp T_g [C]", "Recovery efficiency Reff [-]",
+                    "Annual injected volume [m3]", "max_V [m3/h]",
+                    "HP power_el [kW]", "HP delta_T_coldside [K]",
+                    "HP COP_max [-]", "HP elec_price [euro/kWh]",
+                ],
+                "Value": [
+                    "HP on" if USE_HP else "HP off (no HP object)",
+                    demand.T_in, demand.T_out,
+                    getattr(ATES, "T_return", demand.T_out),
+                    getattr(ATES, "T_floor", np.nan),
+                    ATES.T_g, getattr(ATES, "Reff", np.nan),
+                    getattr(ATES, "volume", np.nan), ATES.max_V,
+                    (hp.power_el         if USE_HP else np.nan),
+                    (hp.delta_T_coldside if USE_HP else np.nan),
+                    (hp.COP_max          if USE_HP else np.nan),
+                    (hp.elec_price       if USE_HP else np.nan),
+                ],
+            })
+            params.to_excel(writer, sheet_name="Parameters", index=False)
 
-        # Economics sheet: two stacked tables with titles.
-        eco_tbl.to_excel(writer, sheet_name="Economics", index=False, startrow=1)
-        ws_eco = writer.sheets["Economics"]
-        ws_eco.cell(row=1, column=1, value="Per-component economics")
-        sum_start = len(eco_tbl) + 4                       # 0-indexed startrow
-        summary_tbl.to_excel(writer, sheet_name="Economics", index=False, startrow=sum_start)
-        ws_eco.cell(row=sum_start, column=1, value="Heat-pump & system summary")
+            # Economics sheet: two stacked tables with titles.
+            eco_tbl.to_excel(writer, sheet_name="Economics", index=False, startrow=1)
+            ws_eco = writer.sheets["Economics"]
+            ws_eco.cell(row=1, column=1, value="Per-component economics")
+            sum_start = len(eco_tbl) + 4                       # 0-indexed startrow
+            summary_tbl.to_excel(writer, sheet_name="Economics", index=False, startrow=sum_start)
+            ws_eco.cell(row=sum_start, column=1, value="Heat-pump & system summary")
 
-        cons.to_excel(writer, sheet_name="Consistency checks", index=False)
-        glossary.to_excel(writer, sheet_name="Glossary", index=False)
+            cons.to_excel(writer, sheet_name="Consistency checks", index=False)
+            glossary.to_excel(writer, sheet_name="Glossary", index=False)
 
-    print(f"\nSaved -> timeseries_HPon.xlsx "
-          f"({len(ts)} timesteps, {ts.shape[1]} columns; "
-          f"sheets: Per-source heat, Parameters, Economics, Consistency checks, Glossary)")
+        print(f"\nSaved -> {OUTFILE} "
+              f"({len(ts)} timesteps, {ts.shape[1]} columns; "
+              f"sheets: Per-source heat, Parameters, Economics, Consistency checks, Glossary)")
     print("\nConsistency checks (Sum |resid| is the strict test):")
     for _, r in cons.iterrows():
         print(f"  [{r['Status']:>5}] {r['Check']:<40} "
-              f"Σresid = {r['Difference A-B [kWh]']:+.3e}   "
-              f"Σ|resid| = {r['Sum |per-hour resid| [kWh]']:.3e}")
+              f"\u03a3resid = {r['Difference A-B [kWh]']:+.3e}   "
+              f"\u03a3|resid| = {r['Sum |per-hour resid| [kWh]']:.3e}")
 
     # --- Console summary: annual totals + economics (HP-aware) -----------------
-    GWh = 1e6
-    LABEL = "Peter (HP on)"
+    LABEL = "Peter (HP on)" if USE_HP else "Peter (no HP)"
 
     print("=" * 64)
     print(f"  MODEL: {LABEL}   annual totals [GWh]")
@@ -419,4 +519,44 @@ if __name__ == "__main__":
               f"-> {co2_df['Cost_CO2'].sum():,.0f} euro/yr")
     print("=" * 64)
 
-    plt.show()
+    if make_plots:
+        plt.show()
+
+    # --- Return headline results so a sweep can collect rows -------------------
+    return {
+        "USE_HP": USE_HP,
+        "tag": tag,
+        "outfile": OUTFILE if write_excel else None,
+        "ATES_MAX_V": ATES_MAX_V,
+        "HP_POWER_EL": HP_POWER_EL if USE_HP else np.nan,
+        "HP_DELTA_T_COLDSIDE": HP_DELTA_T_COLDSIDE if USE_HP else np.nan,
+        "DEMAND_T_IN": DEMAND_T_IN,
+        "DEMAND_T_OUT": DEMAND_T_OUT,
+        "Reff": float(getattr(ATES, "Reff", np.nan)),
+        "injected_volume_m3": float(getattr(ATES, "volume", np.nan)),
+        "extracted_volume_m3": float(np.nansum(getattr(ATES, "flow_extracted", np.nan))),
+        "demand_GWh": result["Demand"].sum() / GWh,
+        "geo_GWh": geo_corr.sum() / GWh,
+        "ates_direct_GWh": ates_dir_corr.sum() / GWh,
+        "hp_GWh": hp_corr.sum() / GWh,
+        "gas_GWh": gas_corr.sum() / GWh,
+        "unmet_GWh": float(np.clip(result["Demand"] - result["Total production"], 0, None).sum() / GWh),
+        "system_lcoh": system_lcoh,
+        "geo_lcoh": df_eco.at["Geothermal well", "LCOE"] if "Geothermal well" in df_eco.index else np.nan,
+        "ates_lcoh": df_eco.at["ATES", "LCOE"] if "ATES" in df_eco.index else np.nan,
+        "gas_lcoh": df_eco.at["Gas boiler", "LCOE"] if "Gas boiler" in df_eco.index else np.nan,
+        "hp_elec_GWh": P_el_total_kWh / GWh,
+        "hp_elec_cost_eur": hp_elec_cost,
+        "hp_mean_COP": mean_cop,
+        "hp_capex_Meur": hp_capex_eur / 1e6,
+        "total_CO2_t": (co2_df["CO2_emission [kg]"].sum() / 1000) if co2_df is not None else np.nan,
+        "total_CO2_cost_eur": (co2_df["Cost_CO2"].sum()) if co2_df is not None else np.nan,
+        "df_eco": df_eco,
+    }
+
+
+# ================================================================== #
+#  Single-run behaviour when executed directly (unchanged output)    #
+# ================================================================== #
+if __name__ == "__main__":
+    run_case(make_plots=True, write_excel=True)

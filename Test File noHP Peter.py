@@ -83,4 +83,28 @@ if __name__ == "__main__":
     print(f"  {'Unmet (Demand-Total, clip)':<28}: "
           f"{np.clip(result['Demand'] - result['Total production'], 0, None).sum() / GWh:8.3f}")
 
+    # --- Timeseries export: per-source heat to demand, every timestep ----------
+    hp_ts = result["Heat pump production"] if "Heat pump production" in result \
+        else pd.Series(0.0, index=result.index)
+    # No HP here -> hp_ts is all zeros, so ATES direct == ATES corrected.
+    ates_direct = result["ATES corrected"] - hp_ts
+
+    ts = pd.DataFrame({
+        "Time (hours)": result["Time (hours)"].values,
+        "Demand [kWh]": result["Demand"].values,
+        "Geothermal [kWh]": result["Geothermal well corrected"].values,
+        "ATES direct [kWh]": ates_direct.values,
+        "Heat pump [kWh]": hp_ts.values,
+        "Gas boiler [kWh]": result["Gas boiler corrected"].values,
+    }).fillna(0.0)
+
+    # Sanity check: the four sources should reconstruct demand on covered hours.
+    ts["Sum sources [kWh]"] = (ts["Geothermal [kWh]"] + ts["ATES direct [kWh]"]
+                               + ts["Heat pump [kWh]"] + ts["Gas boiler [kWh]"])
+
+    with pd.ExcelWriter("timeseries_HPoff.xlsx", engine="openpyxl") as writer:
+        ts.to_excel(writer, sheet_name="Per-source heat", index=False)
+        # writer.sheets["Per-source heat"].freeze_panes = "A2"
+    print(f"\nSaved per-source timeseries -> timeseries_HPoff.xlsx "
+          f"({len(ts)} timesteps)")
     plt.show()
