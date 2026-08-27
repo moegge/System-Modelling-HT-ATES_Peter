@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Test File Sweep Peter 17.08..py
+Test File Sweep Peter Yang 25.08..py
 ==================================================================
 Drives Test_File_Peter_17_08.run_case() across a grid of G/D ratios x system
 configurations (mirroring David Geerts' paper, plus a heat-pump variant), and
 collects the headline results into one summary table + workbook + figures.
+
+DIFFERENCE TO THE 17.08 SWEEP: the system LCOH used in the LCOH figure and in
+the CAC denominator is David's LCOE_calc_Yang figure (pooled discounted cost /
+pooled discounted heat over a COMMON 60-year horizon with reinvestment), not the
+generation-weighted blend of component LCOHs. The blend is not reported here at
+all. All saved files get a '_yang' suffix.
+
+Requires run_case() to return 'system_lcoh_yang' (see Test_File_Peter_17_08.py).
 
 Put this file in the SAME folder as Test_File_Peter_17_08.py, main2_Peter.py,
 ATES_obj_Peter.py and the data files, then:
@@ -150,7 +158,7 @@ def main():
                 print(f"# RUN: {tag}   (GEO_POWER = {geo_power:.1f} kW, demand = {demand_example}"
                       + (f", HP = {int(hp_power)} kW" if hp_power is not None else "") + ")")
                 print("#" * 70)
-                run_outfile = os.path.join(results_dir, f"timeseries_{tag}.xlsx")
+                run_outfile = os.path.join(results_dir, f"timeseries_{tag}_yang.xlsx")
                 run_kwargs = dict(
                     CONFIG=cfg,
                     GEO_POWER=geo_power,
@@ -172,7 +180,7 @@ def main():
                 if SAVE_FIGURES and RUN_MAKE_PLOTS:
                     for local_i, num in enumerate(open_nums, start=1):
                         fig = plt.figure(num)
-                        fig.savefig(os.path.join(results_dir, f"{tag}_fig{local_i}.png"),
+                        fig.savefig(os.path.join(results_dir, f"{tag}_fig{local_i}_yang.png"),
                                     dpi=150, bbox_inches="tight")
                 for num in open_nums:
                     plt.close(plt.figure(num))
@@ -184,20 +192,25 @@ def main():
         "Reff", "injected_volume_m3", "extracted_volume_m3",
         "demand_GWh", "geo_prod_GWh", "geo_to_demand_GWh", "geo_GWh",
         "ates_direct_GWh", "hp_GWh", "gas_GWh", "unmet_GWh",
-        "system_lcoh", "geo_lcoh", "ates_lcoh", "gas_lcoh",
+        "system_lcoh_yang", "geo_lcoh", "ates_lcoh", "gas_lcoh",
         "hp_elec_GWh", "hp_elec_cost_eur", "hp_mean_COP", "hp_capex_Meur",
         "total_CO2_t", "total_CO2_cost_eur",
     ]
     df = pd.DataFrame([{k: r.get(k) for k in summary_cols} for r in results])
+    if df["system_lcoh_yang"].isna().all():
+        raise RuntimeError(
+            "run_case() did not return 'system_lcoh_yang' -- add the LCOE_calc_Yang "
+            "call and the return-dict entry in Test_File_Peter_17_08.py.")
 
     pd.set_option("display.width", 260)
+
     pd.set_option("display.max_columns", 40)
     print("\n" + "=" * 70)
     print("SWEEP SUMMARY")
     print("=" * 70)
     print(df.to_string(index=False))
 
-    out = os.path.join(results_dir, "sweep_summary.xlsx")
+    out = os.path.join(results_dir, "sweep_summary_yang.xlsx")
     fig_data_sheets = {}  # sheet name -> DataFrame, filled in the FIGURES section
 
     # ============================================================== #
@@ -233,12 +246,13 @@ def main():
     # --- Figure: LCOH per combination (David Fig. 4 style) --------------------
     # Component LCOHs (Gas / Geo / ATES) as coloured dots + System LCOH as a
     # cyan dash, grouped by G/D. LCOH stored in euro/kWh -> plotted euro/MWh.
+    # The System dash is LCOE_calc_Yang (60-yr common horizon), matching David.
     fig, ax = plt.subplots(figsize=(max(8, 0.9 * len(df)), 5))
 
     gas  = df["gas_lcoh"].values * 1000.0
     geo  = df["geo_lcoh"].values * 1000.0
     ates = df["ates_lcoh"].values * 1000.0
-    syst = df["system_lcoh"].values * 1000.0
+    syst = df["system_lcoh_yang"].values * 1000.0     # David's LCOE_calc_Yang
 
     ax.scatter(x, gas,  color="tab:red",    label="Gas",  zorder=3)
     ax.scatter(x, geo,  color="tab:blue",   label="Geo",  zorder=3)
@@ -247,7 +261,7 @@ def main():
     for xi, s in zip(x, syst):
         if np.isfinite(s):
             ax.hlines(s, xi - dash, xi + dash, color="tab:cyan", linewidth=2,
-                      zorder=2, label="System" if xi == 0 else None)
+                      zorder=2, label="System (Yang)" if xi == 0 else None)
     # Light vertical separators between G/D groups.
     for i in range(1, len(df)):
         if df["_gd_order"].iloc[i] != df["_gd_order"].iloc[i - 1]:
@@ -256,11 +270,11 @@ def main():
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, fontsize=8)
     ax.set_ylabel("LCOH (\u20ac/MWh)")
-    ax.set_title("LCOH per combination")
+    ax.set_title("LCOH per combination  (system = LCOE_calc_Yang, 60-yr horizon)")
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, "lcoh_per_combination")
+    _save(fig, "lcoh_per_combination_yang")
 
     fig_data_sheets["Fig LCOH data"] = pd.DataFrame({
         "tag": df["tag"].values,
@@ -274,61 +288,82 @@ def main():
         "System [euro/MWh]": syst,
     })
 
-    # --- Figure: Renewable Energy Share (RES) per combination -----------------
-    # Stacked share of DEMAND: Geo (blue) + ATES direct (orange) + HP (green).
+    # --- Figure: Energy share per component ----------------------------------
+    # Exhaustive stacked share of DEMAND, summing to ~1.0:
+    #   Geo (blue) + ATES direct (orange) + HP source heat (green)
+    #   + HP electricity (green, hatched = grid) + Gas (red).
     # Geo uses geo_to_demand_GWh (charging removed) so stored geo is not
-    # double-counted here and again in the ATES segment. Gas = unfilled remainder.
+    # double-counted here and again in the ATES segment. The HP condenser output
+    # is Q_evap + P_el; P_el is grid electricity (same CO2 intensity as the gas
+    # boiler per kWh input), so it is drawn hatched and excluded from the
+    # renewable total printed above each bar.
     dem_arr = df["demand_GWh"].values
-    geo_f  = np.nan_to_num(df["geo_to_demand_GWh"].values) / dem_arr
-    ates_f = np.nan_to_num(df["ates_direct_GWh"].values) / dem_arr
-    hp_f   = np.nan_to_num(df["hp_GWh"].values) / dem_arr
-    gas_f = np.nan_to_num(df["gas_GWh"].values) / dem_arr
+    geo_f     = np.nan_to_num(df["geo_to_demand_GWh"].values) / dem_arr
+    ates_f    = np.nan_to_num(df["ates_direct_GWh"].values) / dem_arr
+    hp_el_f   = np.nan_to_num(df["hp_elec_GWh"].values) / dem_arr          # P_el
+    hp_evap_f = np.nan_to_num(df["hp_GWh"].values) / dem_arr - hp_el_f     # Q_evap
+    gas_f     = np.nan_to_num(df["gas_GWh"].values) / dem_arr
 
     fig, ax = plt.subplots(figsize=(max(8, 0.9 * len(df)), 5))
-    ax.bar(x, geo_f,  color="tab:blue",   label="Geo")
-    ax.bar(x, ates_f, bottom=geo_f,          color="tab:orange", label="ATES direct")
-    ax.bar(x, hp_f,   bottom=geo_f + ates_f, color="tab:green",  label="Heat pump")
+    ax.bar(x, geo_f,     color="tab:blue",   label="Geo")
+    ax.bar(x, ates_f,    bottom=geo_f,       color="tab:orange", label="ATES direct")
+    b = geo_f + ates_f
+    ax.bar(x, hp_evap_f, bottom=b,           color="tab:green",  label="HP source heat")
+    b = b + hp_evap_f
+    ax.bar(x, hp_el_f,   bottom=b,           color="tab:green",  hatch="//",
+           edgecolor="white", label="HP electricity (grid)")
+    b = b + hp_el_f
+    ax.bar(x, gas_f,     bottom=b,           color="tab:red",    label="Gas")
 
     def _seg_label(vals, bottoms):
         for xi, v, bo in zip(x, vals, bottoms):
-            if v > 0.02:
+            if v > 0.015:
                 ax.text(xi, bo + v / 2.0, f"{v:.2f}",
                         ha="center", va="center", fontsize=8)
-    _seg_label(geo_f,  np.zeros_like(geo_f))
-    _seg_label(ates_f, geo_f)
-    _seg_label(hp_f,   geo_f + ates_f)
+    _seg_label(geo_f,     np.zeros_like(geo_f))
+    _seg_label(ates_f,    geo_f)
+    _seg_label(hp_evap_f, geo_f + ates_f)
+    _seg_label(hp_el_f,   geo_f + ates_f + hp_evap_f)
+    _seg_label(gas_f,     geo_f + ates_f + hp_evap_f + hp_el_f)
+
+    # Renewable total (P_el excluded) above each bar.
+    res_total = geo_f + ates_f + hp_evap_f
+    for xi, r, tot in zip(x, res_total, res_total + hp_el_f + gas_f):
+        ax.text(xi, tot + 0.015, f"RES {r:.2f}", ha="center", va="bottom", fontsize=8)
+
     for i in range(1, len(df)):
         if df["_gd_order"].iloc[i] != df["_gd_order"].iloc[i - 1]:
             ax.axvline(i - 0.5, color="0.8", linewidth=1, zorder=1)
 
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, fontsize=8)
-    ax.set_ylabel("Renewable Energy Share (RES)")
-    ax.set_ylim(0, 1.05)
-    ax.set_title("Renewable share of demand per combination")
-    ax.legend()
+    ax.set_ylabel("Share of demand met")
+    ax.set_ylim(0, 1.12)
+    ax.set_title("Energy share per component  (HP split into source heat and grid electricity)")
+    ax.legend(loc="lower right", fontsize=8)
     fig.tight_layout()
-    _save(fig, "res_per_combination")
+    _save(fig, "res_per_combination_yang")
 
-    res_total = geo_f + ates_f + hp_f
     fig_data_sheets["Fig RES data"] = pd.DataFrame({
         "tag": df["tag"].values,
         "config": df["config"].values,
         "GD_target": df["GD_target"].values,
         "HP_POWER_EL": df["HP_POWER_EL"].values,
         "ratio_ATES_HP": df["ratio_ATES_HP"].values,
-        "Geo (RES frac)": geo_f,
-        "ATES direct (RES frac)": ates_f,
-        "Heat pump (RES frac)": hp_f,
-        "Total renewable frac": res_total,
+        "Geo frac": geo_f,
+        "ATES direct frac": ates_f,
+        "HP source heat frac": hp_evap_f,
+        "HP electricity frac": hp_el_f,
         "Gas frac": gas_f,
+        "Total renewable frac (excl. HP elec)": res_total,
+        "Balance check": res_total + hp_el_f + gas_f,
     })
 
 
     # --- Figure: Carbon Abatement Cost (CAC) per combination ------------------
     # CAC = (LCOH_config - LCOH_ref) / (CI_ref - CI_config), in euro/kgCO2.
-    # LCOH   = CO2-INCLUSIVE system LCOH (euro/kWh) -> shifts CAC down by the
-    #          carbon price vs a CO2-free CAC; intentional (Peter's choice).
+    # LCOH   = CO2-INCLUSIVE system LCOH from LCOE_calc_Yang (euro/kWh) -> shifts
+    #          CAC down by the carbon price vs a CO2-free CAC; intentional.
     # CI     = system carbon intensity of delivered heat = total_CO2 / demand
     #          [kgCO2/kWh]. Positive (CI_ref - CI_config) => real abatement.
     # Every config is referenced to the gas-only baseline G WITHIN the same G/D
@@ -358,9 +393,9 @@ def main():
         ref = ref_index.get((row["GD_target"], ref_cfg))
         if ref is None:
             continue
-        lcoh_ref_vals[pos] = ref["system_lcoh"]
+        lcoh_ref_vals[pos] = ref["system_lcoh_yang"]
         ci_ref_vals[pos]   = ref["CI_kg_per_kWh"]
-        d_lcoh = row["system_lcoh"] - ref["system_lcoh"]
+        d_lcoh = row["system_lcoh_yang"] - ref["system_lcoh_yang"]
         d_ci   = ref["CI_kg_per_kWh"] - row["CI_kg_per_kWh"]   # + = abatement
         cac_vals[pos] = d_lcoh / d_ci if abs(d_ci) > 1e-9 else np.nan
 
@@ -392,10 +427,10 @@ def main():
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, fontsize=8)
     ax.set_ylabel("Carbon Abatement Cost (\u20ac/kgCO\u2082)")
-    ax.set_title("CAC per combination")
+    ax.set_title("CAC per combination  (LCOH = LCOE_calc_Yang)")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, "cac_per_combination")
+    _save(fig, "cac_per_combination_yang")
 
     fig_data_sheets["Fig CAC data"] = pd.DataFrame({
         "tag": df["tag"].values,
@@ -404,11 +439,11 @@ def main():
         "HP_POWER_EL": df["HP_POWER_EL"].values,
         "ratio_ATES_HP": df["ratio_ATES_HP"].values,
         "reference config": [CAC_REF.get(c, "") for c in df["config"].values],
-        "LCOH [euro/kWh]": df["system_lcoh"].values,
+        "LCOH [euro/kWh]": df["system_lcoh_yang"].values,
         "LCOH_ref [euro/kWh]": lcoh_ref_vals,
         "CI [kgCO2/kWh]": df["CI_kg_per_kWh"].values,
         "CI_ref [kgCO2/kWh]": ci_ref_vals,
-        "delta_LCOH [euro/kWh]": df["system_lcoh"].values - lcoh_ref_vals,
+        "delta_LCOH [euro/kWh]": df["system_lcoh_yang"].values - lcoh_ref_vals,
         "delta_CI [kgCO2/kWh]": ci_ref_vals - df["CI_kg_per_kWh"].values,
         "CAC [euro/kgCO2]": cac_vals,
     })
@@ -447,7 +482,7 @@ def main():
     ax.set_title("Emissions per kWh delivered")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, "ci_per_combination")
+    _save(fig, "ci_per_combination_yang")
 
     fig_data_sheets["Fig CI data"] = pd.DataFrame({
         "tag": df["tag"].values,

@@ -509,6 +509,9 @@ class ATES_obj:
     def _energy_split(self, flow_m3, T_mean, T_inj, T_demand_out, hp_running):
         """
         Split the heat delivered in one timestep into its physical components.
+        The HP is limited by its electrical (compressor) power: the cold-side
+        ΔT — and thus the injection temperature T_inj — is DERIVED here per
+        timestep, not passed in. Bounded below by the ground temperature T_g.
 
         flow_m3   : volume extracted this timestep [m3]
         T_mean    : mean hot-well extraction temperature over the timestep [C]
@@ -516,7 +519,7 @@ class ATES_obj:
                     (= self.T_return if HP off, = self.T_floor if HP on)
         Returns (Q_dir, Q_evap, P_el, Q_tot, COP) in kWh.
         """
-        C_A = flow_m3 * self.density * self.heat_cap / 3.6e6      # [kWh/K]
+        C_A = flow_m3 * self.density * self.heat_cap / 3.6e6  # [kWh/K]
 
         # (a) Direct HX: only the part of the ATES water ABOVE the DHN return
         Q_dir = C_A * max(0.0, T_mean - self.T_return)
@@ -524,19 +527,25 @@ class ATES_obj:
         if not hp_running or self.HP is None:
             return Q_dir, 0.0, 0.0, Q_dir, np.nan
 
-        # (b) HP evaporator: from min(T_mean, T_return) down to the cold-well floor
+        # (b) Source heat available if this step's water is cooled to the FIXED T_inj.
+        #     Mode B: glide T_return -> T_floor.   Mode D: glide T_mean -> T_floor.
         T_evap_in = min(T_mean, self.T_return)
-        Q_evap = C_A * max(0.0, T_evap_in - T_inj)
-        if Q_evap <= 0.0:
+        Q_evap_avail = C_A * max(0.0, T_evap_in - T_inj)
+        if Q_evap_avail <= 0.0:
             return Q_dir, 0.0, 0.0, Q_dir, np.nan
 
-        # (c) Compressor work.  Q_cond = Q_evap + W  and  COP = Q_cond / W
-        # P: ToDo Check if implementation of HP with temperatures and everythin is correct
-        # Sensitivity vs David's inlet convention + pinch: revisit later.
-        T_source = 0.5 * (T_evap_in + T_inj)          # mean source T over the evaporator
-        COP = self.HP.Calculate_COP(T_demand_out, T_source) #P: Check if this is necessary (guard on COP < 1), implement decision if C is feasible later
-        #if not np.isfinite(COP) or COP <= 1.05:
-            #return Q_dir, 0.0, 0.0, Q_dir, np.nan  # HP not viable this step
+        #     Heat the HP supplies is the VARIABLE output:
+        #     min(source available, what the compressor can process this step).
+        # P: ToDo Check if implementation of HP with temperatures and everything is correct; Implement guard for COP in case of extreme values
+
+        # (c) COP from the actual temperatures this step (varies in mode D).
+        T_source = 0.5 * (T_evap_in + T_inj)  # mean source T over the glide
+        COP = self.HP.Calculate_COP(T_demand_out, T_source)
+
+        # (d) Fixed compressor power caps how much source heat can be moved;
+        #     the delivered heat VOLUME is the outcome.
+        Q_evap_cap = self.HP.power_el * (COP - 1.0) * (self.len_timestep / 3600.0)
+        Q_evap = min(Q_evap_avail, Q_evap_cap)
         P_el = Q_evap / (COP - 1.0)
 
         return Q_dir, Q_evap, P_el, Q_dir + Q_evap + P_el, COP
@@ -551,7 +560,7 @@ class ATES_obj:
         ----------
         T_cutoff : float
             DHN return temperature. Below this the ATES water cannot heat the network
-            passively, so it is both the HX floor and the mode-A injection temperature.
+            passively, so it is both the HX floor and the mode-A injction temperature.
         T_demand_out : float
             DHN supply temperature (the HP condenser sink).
         storage_extraction : array
@@ -601,6 +610,7 @@ class ATES_obj:
         difference = (self.output_t.loc[:, "Outlet_T_hotwell"] - T_cutoff)
         difference[difference < 0] = 0
         # Calculate the heat output of the first 8 years of the hot well based on the difference with the output temperature of the heat network
+        #P: 8-year array is HX-only by design; revisit if it needs to include mode-D/HP heat once HP is credited.
         for i in range(8):
             self.total_heat_extracted_vs_T_ground_kWh_first_8_years[i] = \
                 sum(np.diff(self.output_t.loc[(i)*8736*self.elongation_constant:(i+1)*8736*self.elongation_constant-1, "flow"],
@@ -707,7 +717,7 @@ class ATES_obj:
                 max_flow_generated = self.max_V * len_timestep / 3600
                 continue                      # no flow, do NOT advance T_start
 
-            # ---- 5. Don't over-deliver: shrink the flow to match missing_energy -------- #P: Why should energy generated be too big in the first place? What does this do
+            # ---- 5. Don't over-deliver: shrink the flow to match missing_energy -------- #P: Correct this! adjust initial sizing better, maximize HP contribution when HP is enabled
             if energy_generated > missing_energy[t]:
                 for _ in range(20):
                     factor = missing_energy[t] / energy_generated
@@ -776,15 +786,19 @@ class ATES_obj:
 
         return opex
     def calc_emissions(self,result):
-        #TO DO add the emissions from the electricity.
+        #P: TO DO add the emissions from the electricity.
+        # Embodied geothermal CO2 of the recovered stored heat (recovery-loss inflated).
         try:
             sum_CO2 = 0
             for i in self.supplier:
-                sum_CO2 = i.CO2_kg+sum_CO2
-            return_value =  sum(result["ATES corrected"])*(sum_CO2/self.Reff/len(self.supplier))
-            
+                sum_CO2 = i.CO2_kg + sum_CO2
+            aquifer_kWh = float(np.nansum(self.output_dir) + np.nansum(self.output_evap))
+            return_value = aquifer_kWh * (sum_CO2 / self.Reff / len(self.supplier))
         except:
             return_value = 0
+        # HP compressor electricity CO2 (grid), folded into the ATES row.
+        if self.HP is not None:
+            return_value = return_value + self.HP.calc_emissions(result)
         return return_value
     def remove_data_point(self,thickness,porosity):
         location = self.data[self.data["Porosity"]==porosity]

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import joblib
 import pytest
-from ATES_obj_publish import ATES_obj
+from ATES_obj_Peter import ATES_obj
 from line_profiler import profile
 
 pytestmark = pytest.mark.filterwarnings("error::FutureWarning")
@@ -192,21 +192,21 @@ class demand_class:
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]
             elif example_demand == "TU Delft":
-                path = r'C:\Users\6100430\OneDrive - Universiteit Utrecht\PhD project\PhD python\Warmtevraag_Delft_parquet'
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_parquet'
                 excel_file = pd.read_parquet(path)
                 #excel_file = pd.read_excel(path,"Warmtevraag")
                 excel_file.drop(["Demand Total","Demand OWD"],inplace=True,axis=1)
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]
             elif example_demand == "Delft City":
-                path = r'C:\Users\6100430\OneDrive - Universiteit Utrecht\PhD project\PhD python\Warmtevraag_Delft_parquet'
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_parquet'
                 excel_file = pd.read_parquet(path)
                 #excel_file = pd.read_excel(path,"Warmtevraag")
                 excel_file.drop(["Demand Total","Demand TUD"],inplace=True,axis=1)
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]        
             elif example_demand == "Delft Total":
-                path = r'C:\Users\6100430\OneDrive - Universiteit Utrecht\PhD project\PhD python\Warmtevraag_Delft_parquet'
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_parquet'
                 excel_file = pd.read_parquet(path)
                 #excel_file = pd.read_excel(path,"Warmtevraag")
                 excel_file.drop(["Demand OWD","Demand TUD"],inplace=True,axis=1)
@@ -334,65 +334,102 @@ class supplier_template:
         return generated*self.CO2_kg #gram CO2
 
 
-# class heat_pump_ATES:
-#     #Not tested. 
-#     def __init__(self, power_th = None,delta_T_coldside=None, costperkW = 1200,
-#                  fixed_opex=50, elec_price = 0.15, lifetime = 15):
-#         self.control = 'controlled'
-#         self.type = 'supply'
-#         self.name = "Heat pump"
-#         if power_th == None and delta_T_coldside ==None:
-#             ValueError("give either power or delta_T")
-#         if power_th !=None and delta_T_coldside!=None:
-#             print("both power and delta_T_coldside given, using delta_T")
-#             power=None
-            
-#         self.power_th = power_th #kWth
-#         self.delta_T_coldside=delta_T_coldside
-#         self.message_printed=False
-#         self.capex = costperkW #euro/kWth  
-#         #https://energy.nl/wp-content/uploads/industrial-high-temperature-heat-pump-2-7.pdf OLD SOURCE
-#         #New source: based on SDE++ subsidy
-#         self.fixed_opex = fixed_opex #euro/kWth/yr
-#         self.elec_price = elec_price #electricity price euro/kWh. Electricity price relatively high probably around 0.15
-#         self.lifetime = lifetime
-#     def init(self,ATES):
-#         if ATES.name !='ATES':
-#             ValueError("wrong storage type connected.")
-#         if ATES.max_V == 0:
-#             self.delta_T_coldside=0
-#         elif self.delta_T_coldside == None:
-#             self.delta_T_coldside = self.power_th/ATES.max_V/4186/1000*3600000
-        
-#     def Calculate_COP(self,Tsupply, Tsource):
-#        if Tsource>Tsupply:
-#            print("HP configuration incorrect. Temperature source should be lower than heat sink temperature")
-#        fc = 0.35 + 0.6/200 * (Tsupply - Tsource)
-#        COP = fc * (Tsupply + 273)/(Tsupply -Tsource)
-#        #https://energy.nl/wp-content/uploads/industrial-high-temperature-heat-pump-2-7.pdf
-#        if COP>5:
-#            COP=5
-#            if self.message_printed != True:                        
-#                #print("COP higher than 5, seems unlikely, check your inputs. Set to 5")
-#                self.message_printed=True
-#        return COP 
-#     def calc_output(self,needed_output):
-#         return 0
-#     def calc_emissions(self,result):
-#         return 0
-#     def calc_opex(self,kWh_generated):
-#         try:
-                
-#             self.capex=self.capex*self.rated_power
-#             fixed_opex = self.fixed_opex*self.rated_power
-#             var_opex = self.elec_input*self.elec_price
-#             var_opex[np.isnan(var_opex)] = 0
-    
-#             opex = sum(var_opex)+fixed_opex
-#         except:
-#             self.capex = 0
-#             opex = 0
-#         return opex
+class heat_pump_ATES:
+    """
+    Heat pump on the ATES discharge side.
+    FIXED inputs:  power_el [kW_el] (compressor rating), delta_T_coldside [K]
+                   (cools ATES water this far below the DHN return -> fixed cold-well
+                   injection temperature), and hence a CONSTANT COP.
+    VARIABLE output: heat supplied by the HP, Q_HP = Q_evap + P_el, limited each
+                   step by the compressor power AND the source water available.
+
+    Required by the ATES engine: name == "Heat pump", power_el, delta_T_coldside,
+    Calculate_COP(Tsink, Tsource), and a COP array the ATES writes into.
+    """
+    def __init__(self, power_el, delta_T_coldside,
+                 costperkW=1200, fixed_opex=50, elec_price=0.15,
+                 lifetime=15, COP_max=5.0, CO2_kg_el=200,
+                 M_supplier=0.02, tau_transport=0.0198, P_contract_kW=None,
+                 VR_per_month=36.75, c_contract_per_kW_month=2.0228,
+                 c_max_per_kW_month=3.0966, APV_per_year=1505.00):
+        self.control = 'controlled'
+        self.type    = 'supply'
+        self.name    = "Heat pump"
+
+        self.power_el         = power_el          # [kW_el] fixed compressor rating
+        self.delta_T_coldside = delta_T_coldside  # [K] fixed cooling below the DHN return
+
+        self.capex      = costperkW    # euro/kW
+        self.fixed_opex = fixed_opex   # euro/kW/yr
+        self.elec_price = elec_price   # euro/kWh, flat fallback
+        self.CO2_kg_el = CO2_kg_el  # gCO2/kWh grid intensity (flat; not hour-resolved)
+        self.lifetime   = lifetime
+
+        # Hourly spot price [EUR/kWh], attached by system() when dynamic dispatch
+        # is used. None -> flat elec_price. Stedin MS 2026 tariffs for Eq. 2.
+        self.elec_spot_series = None
+        self.elec_cost_breakdown = None
+        self.M_supplier              = M_supplier
+        self.tau_transport           = tau_transport
+        self.P_contract_kW           = power_el if P_contract_kW is None else P_contract_kW
+        self.VR_per_month            = VR_per_month
+        self.c_contract_per_kW_month = c_contract_per_kW_month
+        self.c_max_per_kW_month      = c_max_per_kW_month
+        self.APV_per_year            = APV_per_year
+
+        self.COP_max     = COP_max
+        self.COP         = None        # array, written by the ATES
+        self.rated_power = None
+        self.elec_input  = None
+
+    def init(self, ATES):
+        if ATES.name != 'ATES':
+            raise ValueError("Heat pump connected to wrong storage type")
+
+    def Calculate_COP(self, Tsink, Tsource):
+        lift = Tsink - Tsource
+        if lift <= 0:
+            return self.COP_max
+        fc  = 0.35 + 0.6/200 * lift
+        return min(fc * (Tsink + 273.0) / lift, self.COP_max)
+
+    def calc_output(self, needed_output):  return 0
+    def calc_emissions(self, result):
+        # Grid CO2 from compressor electricity [g] = P_el [kWh] * CO2_kg_el [gCO2/kWh]
+        try:
+            return float(np.nansum(self.elec_input)) * self.CO2_kg_el
+        except Exception:
+            return 0
+
+    def elec_cost(self, len_timestep=3600):
+        """
+        Annual compressor electricity cost [EUR]. Eq. 2 (hourly spot + degressive
+        tax + transport + capacity charges) when a spot series is attached;
+        flat elec_price otherwise. Stores the component breakdown.
+        """
+        if self.elec_input is None:
+            return 0.0
+        if self.elec_spot_series is None:
+            self.elec_cost_breakdown = None
+            return float(np.nansum(np.nan_to_num(self.elec_input) * self.elec_price))
+        total, breakdown = elec_cost_annual(
+            self.elec_input, self.elec_spot_series, len_timestep=len_timestep,
+            M=self.M_supplier, tau=self.tau_transport,
+            P_contract_kW=self.P_contract_kW,
+            VR_per_month=self.VR_per_month,
+            c_contract_per_kW_month=self.c_contract_per_kW_month,
+            c_max_per_kW_month=self.c_max_per_kW_month,
+            APV_per_year=self.APV_per_year)
+        self.elec_cost_breakdown = breakdown
+        return total
+
+    def calc_opex(self, kWh_generated):
+        try:
+            fixed_opex = self.fixed_opex * self.rated_power
+            opex = self.elec_cost() + fixed_opex
+        except Exception:
+            opex = 0
+        return opex
         
      
 class geothermal:
@@ -538,8 +575,162 @@ class gas_boiler:
     def calc_emissions(self,result):
         return sum(result["Gas boiler corrected"])*self.CO2_kg #Grams
 
+# Energy tax 2026, electricity, excl. VAT (upper kWh limit, EUR/kWh).
+# Zone 5 zakelijk = 0.00310; the compressor never reaches it on its own.
+ENERGY_TAX_BRACKETS_2026 = [
+    (2_900,       0.09161),
+    (10_000,      0.09161),
+    (50_000,      0.06671),
+    (10_000_000,  0.03735),
+    (np.inf,      0.00310),
+]
 
-def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None):
+
+def load_spot_price(csv_path, n_timesteps, year=2025, len_timestep=3600,
+                    col_time="Datetime (Local)", col_price="Price (EUR/MWhe)"):
+    """
+    Day-ahead spot price [EUR/kWh], resampled to len_timestep and length-checked
+    against n_timesteps. Shared by the dispatch signal and the cost calculation
+    so both are driven by exactly the same series.
+    """
+    df = pd.read_csv(csv_path)
+    df[col_time] = pd.to_datetime(df[col_time])
+    df = df[df[col_time].dt.year == year].copy()
+    df = df.dropna(subset=[col_price]).sort_values(col_time).reset_index(drop=True)
+    if df.empty:
+        raise ValueError(f"No price data for year {year} in {csv_path}")
+
+    spot = df[col_price].values / 1000.0          # EUR/MWh -> EUR/kWh
+
+    # Match the demand resampling in demand_class.adjust_for_timesetting
+    factor = 3600 / len_timestep
+    if factor > 1:
+        if factor != int(factor):
+            raise ValueError("len_timestep must divide 3600 evenly")
+        spot = np.repeat(spot, int(factor))
+    elif factor < 1:
+        raise ValueError("len_timestep > 3600 not supported")
+
+    if len(spot) != n_timesteps:
+        raise ValueError(f"price series length {len(spot)} != n_timesteps "
+                         f"{n_timesteps}. Price file gave {len(df)} hours for "
+                         f"{year}; check for DST duplicates or gaps.")
+    return spot
+
+
+def elec_cost_annual(P_el, spot, len_timestep=3600,
+                     M=0.02, tau=0.0198, P_contract_kW=None,
+                     VR_per_month=36.75, c_contract_per_kW_month=2.0228,
+                     c_max_per_kW_month=3.0966, APV_per_year=1505.00,
+                     brackets=ENERGY_TAX_BRACKETS_2026):
+    """
+    Eq. 2 - full annual compressor electricity cost [EUR] from the REALISED
+    per-timestep consumption. Post-simulation: P_el only exists after calc_heat.
+
+    Grid terms are Stedin grootverbruik 2026, category MS (151-1500 kW).
+    P_peak,m is taken as the monthly max of the timestep-average power, so it
+    understates a true 15-min peak -> conservative on the kW-max charge.
+
+    Returns (total_eur, breakdown_dict).
+    """
+    P_el = np.nan_to_num(np.asarray(P_el, dtype=float))
+    spot = np.nan_to_num(np.asarray(spot, dtype=float))
+    if len(P_el) != len(spot):
+        raise ValueError(f"P_el ({len(P_el)}) and spot ({len(spot)}) length mismatch")
+
+    E_total = float(P_el.sum())
+    if E_total <= 0:
+        return 0.0, {}
+
+    # Degressive energy tax on the annual total
+    tax, lower = 0.0, 0.0
+    for upper, rate in brackets:
+        if E_total <= lower:
+            break
+        tax += (min(E_total, upper) - lower) * rate
+        lower = upper
+
+    # Monthly peak power [kW]
+    power_kW = P_el * (3600.0 / len_timestep)
+    hours = np.arange(len(P_el)) * (len_timestep / 3600.0)
+    month = (pd.Timestamp("2025-01-01") + pd.to_timedelta(hours, unit="h")).month
+    peaks = np.array([power_kW[month == m].max() if (month == m).any() else 0.0
+                      for m in range(1, 13)])
+
+    if P_contract_kW is None:
+        P_contract_kW = float(power_kW.max())
+
+    b = {
+        "commodity+markup":  float(((spot + M) * P_el).sum()),
+        "energy tax":        tax,
+        "transport per kWh": tau * E_total,
+        "vastrecht":         12 * VR_per_month,
+        "kW contract":       12 * c_contract_per_kW_month * P_contract_kW,
+        "kW max":            float((c_max_per_kW_month * peaks).sum()),
+        "APV":               APV_per_year,
+    }
+    return float(sum(b.values())), b
+
+
+def build_hp_dispatch(n_timesteps,
+                      csv_path=r"C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Electricity Data\Netherlands.csv",
+                      year=2025, len_timestep=3600,
+                      M=0.02, eb_marg_decision=0.03735, tau=0.0198,
+                      threshold_eur_mwh=60.0, basis="c_marg",
+                      col_time="Datetime (Local)", col_price="Price (EUR/MWhe)",
+                      verbose=True, return_spot=False):
+    """
+    Per-timestep HP dispatch intent from the day-ahead spot price.
+
+    c_marg,i = P_spot,i + M + eb_marg + tau   [EUR/kWh]
+    HP_ON,i  = basis,i < threshold
+
+    Depends only on the price series - no HP consumption, no system state - so it
+    can be built once in preprocessing and reused across scenarios and sweeps.
+    eb_marg is pinned (top zakelijk bracket); see the standalone pricing script.
+
+    Parameters
+    ----------
+    csv_path : str
+        Hourly day-ahead price file [EUR/MWh].
+    n_timesteps : int
+        Length the returned vector must have (= len(demand.data) after
+        adjust_for_timesetting, i.e. 8760 * 3600/len_timestep).
+    basis : {"c_marg", "spot"}
+        Threshold on the all-in marginal cost, or on the raw wholesale price.
+
+    Returns
+    -------
+    np.ndarray of bool, length n_timesteps
+    """
+    if basis not in ("c_marg", "spot"):
+        raise ValueError("basis must be 'c_marg' or 'spot'")
+
+    spot = load_spot_price(csv_path, n_timesteps, year=year,
+                           len_timestep=len_timestep,
+                           col_time=col_time, col_price=col_price)
+
+    # eb_marg_decision is the DECISION rate only: 0.03735 is the bracket the
+    # compressor's annual consumption (~0.5-2 GWh) always lands in. The full
+    # degressive stack is applied afterwards in elec_cost_annual.
+    adder = M + eb_marg_decision + tau
+    c_marg = spot + adder
+
+    basis_mwh = (c_marg if basis == "c_marg" else spot) * 1000.0
+    hp_on = basis_mwh < threshold_eur_mwh
+
+    if verbose:
+        n_on = int(hp_on.sum())
+        print(f"  HP dispatch: {n_on:,}/{len(hp_on):,} steps ON "
+              f"({n_on/len(hp_on)*100:.1f}%) | threshold "
+              f"{threshold_eur_mwh:.1f} EUR/MWh on {basis} | adder "
+              f"{adder*1000:.2f} EUR/MWh", flush=True)
+
+    return (hp_on, spot) if return_spot else hp_on
+
+def system(demand, supply, len_timestep = 3600, time_horizon=8760, control = None,
+           hp_on=None, hp_dynamic_dispatch=False, hp_threshold_eur_mwh=60.0,
+           hp_elec_spot_series=None):
     """
     Simulates the interaction between demand and supply components in an district heating system.
     
@@ -646,6 +837,7 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None
         for i in supply:
             if i.control == "controlled" or i.control == 'storage':
                 continue
+            break_loop=0
             for j in storage_obj.supplier: 
                 if i.name == j.name:
                     break_loop = 1
@@ -653,7 +845,7 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None
                 break_loop=0
                 continue
             flow_not_covered = flow_not_covered - df_flow[i.name + " Corrected volume"]
-        
+
         # Uncovered flow cannot be negative, clip to 0
         flow_not_covered = np.clip(flow_not_covered,a_min = 0, a_max=None)
         
@@ -671,6 +863,14 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None
         # Initialize for later
         df_flow["Total flow to storage"] = 0
         T_total = 0
+        # Fixed cold-well temperature (modelling assumption: it does not change).
+        # Set equal to the level the discharge HP cools to (= T_floor in calc_heat),
+        # so charging and discharging use the SAME cold-well temperature. Bounded
+        # below by the ground temperature. No HP -> cold well stays at the return.
+        if storage_obj.HP is not None:
+            T_cold = max(demand.T_out - storage_obj.HP.delta_T_coldside, storage_obj.T_g)
+        else:
+            T_cold = demand.T_out
         
         # For each supply connected to storage, check how much volume can go to the storage
         for i in storage_obj.supplier: 
@@ -678,8 +878,9 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None
             if storage_obj.HP != None:
                 storage_obj.HP.init(storage_obj)
                 #Calculate the reduction of volume that can go the to ATES due to a larger temperature difference generated by the HP.
-                #This is based on the assumption that a lower temperature is injected into the cold side and this is then needs to be heated up further, reducing total volume
-                Factor_due_HP = (i.T_out-(demand.T_out-storage_obj.HP.delta_T_coldside))/(i.T_out-demand.T_out) #? Check later!
+                # Charging works from the FIXED cold-well temperature up to the supply
+                # temperature; larger delta -> less water needed for the same heat.
+                Factor_due_HP = (i.T_out - T_cold) / (i.T_out - demand.T_out) #? Adapt later to actual losses! Also adapt plotting at comment here: Changeplothere
             else:
                 Factor_due_HP=1
                 
@@ -692,7 +893,7 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None
     
         # Calculate the temperature to the storage
         if sum(df_flow["Total flow to storage"])>0:
-             T_av = T_total/sum(df_flow["Total flow to storage"])
+             T_av = T_total/sum(df_flow["Total flow to storage"]) #P: Adapt once ATES charging by HP is implemented
         else:
             T_av=0
        
@@ -721,10 +922,7 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None
                     Heat_to_storage = sum(dummy_flow)*(T_av-demand.T_out)
                     
                     #Initialize cold well and calculate Reff of that well
-                    if storage_obj.HP != None:
-                        storage_obj.init_cold_well(demand.T_out-storage_obj.HP.delta_T_coldside,volume)
-                    else:
-                        storage_obj.init_cold_well(demand.T_out+T_ineff_due_HX,volume)
+                    storage_obj.init_cold_well(T_cold, volume) #P: HX Inefficiency could be implemented here
                         
                     #Calculate extra volume required due to heat losses
                     volume = Heat_to_storage/(T_av-storage_obj.cold_well_T_ave)
@@ -755,25 +953,57 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760,control = None
             # Initialize storage
             storage_obj.initialize(sum(df_flow["Total flow to storage"]),T_av-T_ineff_due_HX, len_timestep)
 
-            # Calculate energy that can be covered by the storage and what the output of storage is
-            missing_energy = result['Demand']-result['Total production']
-            output_storage = storage_obj.calc_heat(demand.T_out,demand.T_in,storage_extraction,missing_energy,len_timestep=len_timestep,control = control)    
+            # Energy still to be covered, and the ATES(+HP) output for it.
+            missing_energy = result['Demand'] - result['Total production']
 
-            # Calculate the contribution of the heat pump and the required power of the HP
-            if storage_obj.HP != None:
-                output_HP = storage_obj.HP.delta_T_coldside*storage_obj.flow_extracted*1000*4186/3600000 #P: this is the heat delivered by HP
-                result["Heat pump production"]=output_HP
-                storage_obj.HP.rated_power=max(output_HP)/(len_timestep/3600) #kWh
-                storage_obj.HP.COP[storage_obj.HP.COP == 0] = np.nan 
-                storage_obj.HP.elec_input = output_HP/storage_obj.HP.COP
+            # Per-timestep HP dispatch vector, passed straight to the ATES model.
+            # Built here from the spot price if none was supplied, so the caller
+            # doesn't have to. demand.adjust_for_timesetting has already run, so
+            # len(demand.data) is the correct timestep count.
+            if storage_obj.HP is not None and hp_on is None and hp_dynamic_dispatch:
+                hp_on, hp_elec_spot_series = build_hp_dispatch(
+                    n_timesteps=len(demand.data), len_timestep=len_timestep,
+                    threshold_eur_mwh=hp_threshold_eur_mwh, return_spot=True)
+
+            # Carry the hourly spot price to the economics. Eq. 2 is evaluated
+            # after the run, from the realised P_el. None -> flat elec_price.
+            if storage_obj.HP is not None:
+                storage_obj.HP.elec_spot_series = hp_elec_spot_series
+
+            if storage_obj.HP is not None and hp_on is not None:
+                hp_vec = np.asarray(hp_on, dtype=bool)
+                if len(hp_vec) != len(missing_energy):
+                    raise ValueError(f"hp_on must have one value per timestep "
+                                     f"({len(missing_energy)}), got {len(hp_vec)}")
+            else:
+                # No HP, or no dispatch intent -> pass None. calc_heat keeps the HP off,
+                # and the mode-D override is itself guarded by 'self.HP is not None',
+                # so with no HP nothing can turn it on.
+                hp_vec = None
+
+            output_storage = storage_obj.calc_heat(
+                demand.T_out, demand.T_in, storage_extraction, missing_energy,
+                hp_on=hp_vec, len_timestep=len_timestep, control=control)
+
+            # HP contribution is computed inside calc_heat and stored on the object.
+            if storage_obj.HP is not None:
+                output_HP = storage_obj.output_HP  # condenser heat = Q_evap + P_el [kWh]
+                result["Heat pump production"] = output_HP
+                storage_obj.HP.rated_power = storage_obj.HP.power_el  # fixed compressor rating [kW]
+                storage_obj.HP.elec_input = storage_obj.P_el  # compressor electricity [kWh]
+                storage_obj.HP.COP = storage_obj.COP  # per-timestep COP (NaN when off)
             else:
                 output_HP = 0
-                result["Heat pump production"]=output_HP
-            
-            # Save the calculations.
-            result[storage_obj.name+" production"] = output_storage-output_HP #P: output_storage might not contain heat produced by HP
-            result['Total production'] = result['Total production']+ result[storage_obj.name+" production"]+result["Heat pump production"]
-        
+                result["Heat pump production"] = output_HP
+
+            # ATES production now represents the WHOLE subsystem (direct HX + HP condenser).
+            # Keep the direct-only part (Q_dir) available for plotting / inspection.
+            result[storage_obj.name + " production"]  = output_storage            # ATES + HP
+            result[storage_obj.name + " direct only"] = output_storage - output_HP  # Q_dir
+            result['Total production'] = (result['Total production']
+                                          + result[storage_obj.name + " production"])
+            # HP is already inside "ATES production" -> do NOT add "Heat pump production" again.
+
         # If not flow to storage, it is deemed useless    
         else:
             #print("Storage is neglected, no volume available for storage")
@@ -864,6 +1094,16 @@ def LCOE_calc_Yang(result,supply,df_eco,disc_rate=0.05,lifetime_system = 60,cape
             if real_extracted == 0:
                 continue
             max_extracted = i.total_heat_extracted_vs_T_ground_kWh_first_8_years[-1]
+            # Utilisation of the well's annual capacity, on an HX-only basis.
+            #   numerator   = "ATES corrected" = Q_dir + Q_evap + P_el, demand-clipped
+            #                 (the WHOLE subsystem, HP condenser heat included)
+            #   denominator = year-8 extractable heat above T_cutoff over the full
+            #                 volume curve. NOTE the array name says T_ground but
+            #                 calc_heat computes it against T_cutoff.
+            # Can exceed 1.0 in GGAH: the HP draws from the band below T_cutoff,
+            # which the denominator does not count. Diagnostic only - the LCOE
+            # level is unaffected, since max_extracted cancels in mature years
+            # (j % lifetime >= 8) and the array only carries the ramp shape.
             percentage = real_extracted/max_extracted
             opex = df_eco.at[i.name,"opex"]
 
@@ -991,7 +1231,7 @@ def LCOE_calc(result, supply, df_eco,disc_rate=0.05):
             real_extracted = sum(result["ATES corrected"])
             if real_extracted == 0:
                 continue
-            max_extracted = i.total_heat_extracted_vs_T_ground_kWh_first_8_years[-1]
+            max_extracted = i.total_heat_extracted_vs_T_ground_kWh_first_8_years[-1] #P: check what exactly this does; is this affected by the implementation of the HP?
             percentage = real_extracted/max_extracted
             opex = df_eco.at[i.name,"opex"]
 
@@ -1065,7 +1305,7 @@ def LCOE_calc(result, supply, df_eco,disc_rate=0.05):
             df_eco.at[i.name,"generated discounted"] = generated
     return df_eco
 
-def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=False,CO2_price = 70,opex_ATES_fixed=False):
+def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=False,CO2_price = 70,opex_ATES_fixed=False,len_timestep=3600):
     """
     Performs economic analysis to calculate operational and capital expenses, as well as the Levelized Cost of Energy (LCOE)
     for each supply component in the energy system.
@@ -1098,20 +1338,42 @@ def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=Fa
     if incorporate_CO2:
         CO2_df = CO2_emissions_calc(results_system, supply, CO2_price=CO2_price)
     for count, i in enumerate(supply):
+        hp_capex = 0
         if i.name == "ATES":
             if opex_ATES_fixed:
                 try:
                     df_eco.loc[i.name,"opex"]=i.fix_opex+(i.volume+sum(i.flow_extracted))/2/1000000*1389*1000*i.elec_price
                 except:
                     df_eco.loc[i.name,"opex"] = 0
-            
             else:
                 df_eco.loc[i.name,"opex"]= i.calc_opex(sum(results_system[i.name + " corrected"]))
+
+            # --- Discharge-side HP economics (HP is bolted onto the ATES) ---
+            hp = getattr(i, "HP", None)
+            if hp is not None:
+                elec = getattr(hp, "elec_input", None)
+                elec_kWh = float(np.nansum(elec)) if elec is not None else 0.0  # compressor kWh/yr
+                hp_rating = getattr(hp, "rated_power", None) or hp.power_el  # kW
+                # Eq. 2 when an hourly spot series is attached, flat otherwise.
+                df_eco.loc[i.name, "opex"] = (df_eco.loc[i.name, "opex"]
+                                              + hp.elec_cost(len_timestep=len_timestep)
+                                              + hp.fixed_opex * hp_rating)  # HP fixed opex
+                hp_capex = 0.0  # hp.capex holds euro/kW  -> total euro
+                # The HP (hp.lifetime) is amortised inside the ATES row over i.lifetime.
+                # Buy a unit whenever the previous one expires, discounted to year 0, and
+                # pay only for the years actually used -> the last unit (and the first, if
+                # the HP outlives the ATES) is bought as a fraction. CAPEX ONLY: the HP
+                # opex above is euro/kW/yr on hp_rating and euro/kWh on electricity,
+                # neither derived from hp_capex.
+                for k in range(0, i.lifetime, hp.lifetime):
+                    frac = min(hp.lifetime, i.lifetime - k) / hp.lifetime
+                    hp_capex += (hp_rating * hp.capex * frac) / (1 + disc_rate) ** k
+
         else:
             #df_eco["opex"].iloc[count] = i.calc_opex(sum(results_system[i.name + " corrected"]))
             df_eco.loc[i.name,"opex"]= i.calc_opex(sum(results_system[i.name + " corrected"]))
         df_eco.at[i.name,"name"] = i.name
-        df_eco.at[i.name,"capex"] = i.capex
+        df_eco.at[i.name,"capex"] = i.capex + hp_capex
         if incorporate_CO2:
             df_eco.at[i.name,"opex"] =df_eco.at[i.name, "opex"] + CO2_df.at[i.name,'Cost_CO2']
 
@@ -1123,12 +1385,12 @@ def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=Fa
 
 def CO2_emissions_calc(result,supply,CO2_price = 70):
     #Price CO2 in euro/ton
-    
+
     index = []
     for i in supply:
         index.append(i.name)
     df_CO2 = pd.DataFrame(index=index, columns=["name", "CO2_emission [kg]"])
-    
+
     for i in supply:
         df_CO2.at[i.name,"name"] = i.name
         df_CO2.at[i.name,"CO2_emission [kg]"] = i.calc_emissions(result)/1000
@@ -1145,7 +1407,13 @@ def system_plot(result, supply, demand, len_timestep = 3600,setting = "everythin
             Storage = True
             storage_obj = i
 
-        
+    # Fixed cold-well temperature, identical to system(): keeps the plotted storage
+    # bands consistent with the Factor_due_HP the simulation actually used.
+    # P: Change this once the loop regarding the cold well losses is improved! Changeplothere
+    if Storage and storage_obj.HP is not None:
+        T_cold = max(demand.T_out - storage_obj.HP.delta_T_coldside, storage_obj.T_g)
+    else:
+        T_cold = demand.T_out
     for i in supply:
         if i.control == "stable":
             if Storage:
@@ -1181,62 +1449,83 @@ def system_plot(result, supply, demand, len_timestep = 3600,setting = "everythin
     #ax.fill_between(result["Time (hours)"],result["Demand"],0)
     #plt.plot(result["Time (hours)"],result["Total production"], label = "Total production")
 
-  
     if setting == "everything":
         i_list = []
         save_value = np.zeros(len(result))
+        hp = result["Heat pump production"] / (len_timestep / 3600) if "Heat pump production" in result else np.zeros(
+            len(result))  # HP: discharge heat-pump band [kW]
+        hp_offset = np.zeros(len(result))  # HP: added to later bands so they stack on top of the HP
         for i in supply:
             i_list.append(i)
             value = 0
             for j in range(len(i_list)):
-                value += result[i_list[j].name + " production"] /(len_timestep/3600)
-            #plt.plot(result["Time (hours)"],value,label = i.name,visible=False)
-            ax.fill_between(result["Time (hours)"],value, save_value,label=i.name)
+                nm = i_list[j].name
+                # ATES production now includes the HP; use the direct-only part for the band
+                # so the HP is drawn once, as its own band on top.
+                col = nm + " direct only" if (nm + " direct only") in result else nm + " production"
+                value += result[col] / (len_timestep / 3600)
+            value = value + hp_offset  # HP
+            # plt.plot(result["Time (hours)"],value,label = i.name,visible=False)
+            ax.fill_between(result["Time (hours)"], value, save_value, label=i.name)
             save_value = value
-        plt.plot(result["Time (hours)"],result["Demand"]/(len_timestep/3600),label = 'demand', color = 'k',linewidth = 0.5)
+            if i.control == "storage" and np.nansum(hp) > 1e-9:  # HP: draw the discharge heat pump on top of the ATES
+                ax.fill_between(result["Time (hours)"], value + hp, value, label="Heat pump")
+                save_value = value + hp
+                hp_offset = hp
+        plt.plot(result["Time (hours)"], result["Demand"] / (len_timestep / 3600), label='demand', color='k',
+                 linewidth=0.5)
         plt.legend()
-        plt.xlim([0,max(result["Time (hours)"])])
+        plt.xlim([0, max(result["Time (hours)"])])
         plt.xlabel("Time (hours)")
         plt.ylabel("Energy (kW)")
     elif setting == "ordered":
-        result = result.sort_values(by=["Demand"],ascending=False)
+        result = result.sort_values(by=["Demand"], ascending=False)
         i_list = []
         save_value = np.zeros(len(result))
+        hp = result["Heat pump production"] / (len_timestep / 3600) if "Heat pump production" in result else np.zeros(
+            len(result))  # HP: discharge heat-pump band [kW]
+        hp_offset = np.zeros(len(result))  # HP: added to later bands so they stack on top of the HP
         for i in supply:
-            if np.isnan(result[i.name + " corrected"][0] ):
+            if np.isnan(result[i.name + " corrected"][0]):
                 continue
             i_list.append(i)
             value = 0
 
             for j in range(len(i_list)):
-                value += result[i_list[j].name + " corrected"] /(len_timestep/3600)
-            #plt.plot(result["Time (hours)"],value,label = i.name)
-            ax.fill_between(np.linspace(0,len(result),len(result)),value, save_value, label=i.name)
+                nm = i_list[j].name
+                value += result[nm + " corrected"] / (len_timestep / 3600)
+                # ATES corrected now includes HP heat; strip it so the HP band on top
+                # isn't double counted (mirrors the "everything" setting).
+                if i_list[j].control == "storage" and "Heat pump production" in result:
+                    value -= result["Heat pump production"] / (len_timestep / 3600)
+            value = value + hp_offset  # HP
+            # plt.plot(result["Time (hours)"],value,label = i.name)
+            ax.fill_between(np.linspace(0, len(result), len(result)), value, save_value, label=i.name)
             save_value = value
+            if i.control == "storage" and np.nansum(hp) > 1e-9:  # HP: draw the discharge heat pump on top of the ATES
+                ax.fill_between(np.linspace(0, len(result), len(result)), value + hp, value, label="Heat pump")
+                save_value = value + hp
+                hp_offset = hp
         if Storage:
-            for i in supply:
-                for j in storage_obj.supplier: 
-                    if i.name == j.name:                                
-                        if storage_obj.HP != None:
-                            Factor_due_HP = (j.T_out-(demand.T_out-storage_obj.HP.delta_T_coldside))/(j.T_out-demand.T_out)
-                        else:
-                            Factor_due_HP = 1
+            Factor_due_HP = 1 #P: Revisit to update cold well loss iteration runs, implement that it is not always lowered to T_floor
             to_storage = 0
             for i in supply:
                 for j in storage_obj.supplier:
                     if j.name == i.name:
-                        to_storage = to_storage + result[i.name + " percentage to storage"]*result[i.name+ " production"]/Factor_due_HP
-                        unused = result[i.name + " production"] -to_storage*Factor_due_HP-result["Demand"]
+                        to_storage = to_storage + result[i.name + " percentage to storage"] * result[
+                            i.name + " production"] / Factor_due_HP
+                        unused = result[i.name + " production"] - to_storage * Factor_due_HP - result["Demand"]
 
-            unused = np.clip(unused, a_min=0,a_max=None) 
-            unused = unused *(unused > 0.001)
-            unused = result["Demand"]+unused
-            HP = to_storage*Factor_due_HP+unused
-            to_storage = to_storage+unused
-            ax.fill_between(np.linspace(0,len(result),len(result)),HP/(len_timestep/3600),result['Demand']/(len_timestep/3600), label="HP to storage")
-            ax.fill_between(np.linspace(0,len(result),len(result)),to_storage/(len_timestep/3600),result['Demand']/(len_timestep/3600),label="To storage")
-            ax.fill_between(np.linspace(0,len(result),len(result)),unused/(len_timestep/3600),result['Demand']/(len_timestep/3600), label="Unused")
-        plt.plot(np.linspace(0,len(result),len(result)),result["Demand"]/(len_timestep/3600),label = 'demand',color = 'k',linewidth = 0.5)
+            unused = np.clip(unused, a_min=0, a_max=None)
+            unused = unused * (unused > 0.001)
+            unused = result["Demand"] + unused
+            to_storage = to_storage + unused
+            ax.fill_between(np.linspace(0, len(result), len(result)), to_storage / (len_timestep / 3600),
+                            result['Demand'] / (len_timestep / 3600), label="To storage")
+            ax.fill_between(np.linspace(0, len(result), len(result)), unused / (len_timestep / 3600),
+                            result['Demand'] / (len_timestep / 3600), label="Unused")
+        plt.plot(np.linspace(0, len(result), len(result)), result["Demand"] / (len_timestep / 3600), label='demand',
+                 color='k', linewidth=0.5)
         plt.legend()
         plt.ylim([0,max(result["Demand"])/(len_timestep/3600)*1.1])
         plt.xlim([0,len(result)])
@@ -1246,6 +1535,9 @@ def system_plot(result, supply, demand, len_timestep = 3600,setting = "everythin
     elif setting == "demand_met":
         i_list = []
         save_value = np.zeros(len(result))
+        hp = result["Heat pump production"] / (len_timestep / 3600) if "Heat pump production" in result else np.zeros(
+            len(result))  # HP: discharge heat-pump band [kW]
+        hp_offset = np.zeros(len(result))  # HP: added to later bands so they stack on top of the HP
         for i in supply:
             if np.isnan(result[i.name + " corrected"][0] ):
                 continue
@@ -1253,89 +1545,95 @@ def system_plot(result, supply, demand, len_timestep = 3600,setting = "everythin
             value = 0
 
             for j in range(len(i_list)):
-                value += result[i_list[j].name + " corrected"] /(len_timestep/3600)
-            #plt.plot(result["Time (hours)"],value,label = i.name)
-            ax.fill_between(result["Time (hours)"],value, save_value, label=i.name)
+                nm = i_list[j].name
+                value += result[nm + " corrected"] / (len_timestep / 3600)
+                # ATES corrected now includes HP heat; strip it so the HP band on top
+                # isn't double counted (mirrors the "everything" setting).
+                if i_list[j].control == "storage" and "Heat pump production" in result:
+                    value -= result["Heat pump production"] / (len_timestep / 3600)
+            value = value + hp_offset  # HP
+            # plt.plot(result["Time (hours)"],value,label = i.name)
+            ax.fill_between(result["Time (hours)"], value, save_value, label=i.name)
             save_value = value
+            if i.control == "storage" and np.nansum(hp) > 1e-9:  # HP: draw the discharge heat pump on top of the ATES
+                ax.fill_between(result["Time (hours)"], value + hp, value, label="Heat pump")
+                save_value = value + hp
+                hp_offset = hp
         if Storage:
             for i in supply:
                 for j in storage_obj.supplier: 
                     if i.name == j.name:                                
                         if storage_obj.HP != None:
-                            Factor_due_HP = (j.T_out-(demand.T_out-storage_obj.HP.delta_T_coldside))/(j.T_out-demand.T_out)
+                            Factor_due_HP = 1 #Changeplothere
                         else:
                             Factor_due_HP = 1
             to_storage = 0
             for i in supply:
                 for j in storage_obj.supplier:
                     if j.name == i.name:
-                        to_storage = to_storage + result[i.name + " percentage to storage"]*result[i.name+ " production"]/Factor_due_HP
-                        unused = result[i.name + " production"] -to_storage*Factor_due_HP-result["Demand"]
+                        to_storage = to_storage + result[i.name + " percentage to storage"] * result[
+                            i.name + " production"] / Factor_due_HP
+                        unused = result[i.name + " production"] - to_storage * Factor_due_HP - result["Demand"]
 
-            unused = np.clip(unused, a_min=0,a_max=None) 
-            unused = unused *(unused > 0.001)
-            unused = result["Demand"]+unused
-            HP = to_storage*Factor_due_HP+unused
-            to_storage = to_storage+unused
-            if (HP.sum())-to_storage.sum() !=0:
-                ax.fill_between(result["Time (hours)"],HP/(len_timestep/3600),result['Demand']/(len_timestep/3600), label="HP to storage")
-            if (to_storage.sum()-unused.sum())!=0:
-                ax.fill_between(result["Time (hours)"],to_storage/(len_timestep/3600),result['Demand']/(len_timestep/3600),label="To storage")
-            if (unused.sum())-(to_storage.sum())!=0:
-                ax.fill_between(result["Time (hours)"],unused/(len_timestep/3600),result['Demand']/(len_timestep/3600), label="Unused")
- 
-                        
-                        
-        plt.plot(result["Time (hours)"],result["Demand"]/(len_timestep/3600),label = 'demand',color = 'k',linewidth = 0.5)
+            unused = np.clip(unused, a_min=0, a_max=None)
+            unused = unused * (unused > 0.001)
+            unused = result["Demand"] + unused
+            HP = to_storage * Factor_due_HP + unused
+            to_storage = to_storage + unused
+            if (HP.sum()) - to_storage.sum() != 0:
+                ax.fill_between(result["Time (hours)"], HP / (len_timestep / 3600),
+                                result['Demand'] / (len_timestep / 3600), label="HP to storage")
+            if (to_storage.sum() - unused.sum()) != 0:
+                ax.fill_between(result["Time (hours)"], to_storage / (len_timestep / 3600),
+                                result['Demand'] / (len_timestep / 3600), label="To storage")
+            if (unused.sum()) - (to_storage.sum()) != 0:
+                ax.fill_between(result["Time (hours)"], unused / (len_timestep / 3600),
+                                result['Demand'] / (len_timestep / 3600), label="Unused")
+
+        plt.plot(result["Time (hours)"], result["Demand"] / (len_timestep / 3600), label='demand', color='k',
+                 linewidth=0.5)
         plt.legend()
-        plt.xlim([0,max(result["Time (hours)"])])
-        plt.ylim([0,max(result["Demand"])/(len_timestep/3600)*1.1])
+        plt.xlim([0, max(result["Time (hours)"])])
+        plt.ylim([0, max(result["Demand"]) / (len_timestep / 3600) * 1.1])
         plt.xlabel("Time (hours)")
         plt.ylabel("Energy (kW)")
     elif setting == "Geothermal plot":
-          i_list = []
-          save_value = np.zeros(len(result))
-          for i in supply:
-              if i.name == "Geothermal well":
-                  
+        i_list = []
+        save_value = np.zeros(len(result))
+        for i in supply:
+            if i.name == "Geothermal well":
+
                 i_list.append(i)
                 value = 0
                 for j in range(len(i_list)):
-                    value += max(result[i_list[j].name + " corrected"]) /(len_timestep/3600)
-                #plt.plot(result["Time (hours)"],value,label = i.name)
-                ax.fill_between(result["Time (hours)"],value, save_value, label=i.name)
+                    value += max(result[i_list[j].name + " corrected"]) / (len_timestep / 3600)
+                # plt.plot(result["Time (hours)"],value,label = i.name)
+                ax.fill_between(result["Time (hours)"], value, save_value, label=i.name)
                 save_value = value
-          if Storage:
-              for i in supply:
-                  for j in storage_obj.supplier: 
-                      if i.name == j.name:                                
-                          if storage_obj.HP != None:
-                              Factor_due_HP = (j.T_out-(demand.T_out-storage_obj.HP.delta_T_coldside))/(j.T_out-demand.T_out)
-                          else:
-                              Factor_due_HP = 1
-              to_storage = 0
-              for i in supply:
-                  for j in storage_obj.supplier:
-                      if j.name == i.name:
-                          to_storage = to_storage + result[i.name + " percentage to storage"]*result[i.name+ " production"]/Factor_due_HP
+        if Storage:
+            for i in supply:
+                for j in storage_obj.supplier:
+                    if i.name == j.name:
+                        if storage_obj.HP != None:
+                            Factor_due_HP = 1 #Changeplothere (old:Factor_due_HP = (j.T_out-(demand.T_out-storage_obj.HP.delta_T_coldside))/(j.T_out-demand.T_out))
+                        else:
+                            Factor_due_HP = 1
+            to_storage = 0
+            for i in supply:
+                for j in storage_obj.supplier:
+                    if j.name == i.name:
+                        to_storage = to_storage + result[i.name + " percentage to storage"] * result[
+                            i.name + " production"] / Factor_due_HP
 
-              ax.fill_between(result["Time (hours)"],save_value-(to_storage/(len_timestep/3600)),save_value,label="To storage")
-   
-                          
-                          
-          plt.plot(result["Time (hours)"],result["Demand"]/(len_timestep/3600),label = 'demand',color = 'k',linewidth = 0.5)
-          plt.legend()
-          plt.xlim([0,max(result["Time (hours)"])])
-          plt.ylim([0,max(result["Demand"])/(len_timestep/3600)*1.1])
-          plt.xlabel("Time (hours)")
-          plt.ylabel("Energy (kWh)")
+            ax.fill_between(result["Time (hours)"], save_value - (to_storage / (len_timestep / 3600)), save_value,
+                            label="To storage")
+
+        plt.plot(result["Time (hours)"], result["Demand"] / (len_timestep / 3600), label='demand', color='k',
+                 linewidth=0.5)
+        plt.legend()
+        plt.xlim([0, max(result["Time (hours)"])])
+        plt.ylim([0, max(result["Demand"]) / (len_timestep / 3600) * 1.1])
+        plt.xlabel("Time (hours)")
+        plt.ylabel("Energy (kWh)")
     else:
         raise ValueError("Wrong setting chosen. Choose between demand_met and everything")
-
-
-               
-               
-               
-               
-    
-    
