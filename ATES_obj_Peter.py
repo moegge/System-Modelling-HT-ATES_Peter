@@ -12,6 +12,9 @@ from scipy.signal import argrelextrema
 from scipy.optimize import curve_fit
 import time 
 import math
+import warnings
+import os
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 from line_profiler import profile
 from bisect import bisect_left, bisect_right
@@ -50,6 +53,29 @@ def get_closests(df, col, val):
     else:                            #val is in the list
         return lower_idx
     
+def cold_well_T(T_return, T_ground, HP=None):
+    """
+    Cold-well / HP cold-side temperature [C]. Single definition, shared by
+    ATES_obj.calc_heat (self.T_floor), system() (charge-leg Factor_due_HP) and
+    system_plot(), so the three can never drift apart.
+
+    No HP -> the HX cannot cool below the DHN return, so T_return.
+    HP    -> T_return - delta_T_coldside, bounded below by the ground temperature.
+
+    An absolute floor (permitting, well integrity) would go here as an optional
+    HP.T_floor_abs override; currently the relative definition is used.
+    """
+    if HP is None:
+        return float(T_return)
+    target = T_return - HP.delta_T_coldside
+    if target < T_ground:
+        warnings.warn(
+            f"HP cold-side target {target:.1f} C is below ground temperature "
+            f"{T_ground:.1f} C; clipped. Effective delta_T_coldside is "
+            f"{T_return - T_ground:.1f} K, not {HP.delta_T_coldside:.1f} K.",
+            RuntimeWarning, stacklevel=2)
+        return float(T_ground)
+    return float(target)
 
 class ATES_obj:
     """
@@ -160,7 +186,7 @@ class ATES_obj:
         if timing:
             start = time.time()
         # Get data from earlier research, saved in parquet file and manipulate it 
-        self.data = pd.read_parquet('results_AXI_V2')
+        self.data = pd.read_parquet(os.path.join(_HERE, 'results_AXI_V2'))
 
         if timing:
             print('Loading parquet data took {}s'.format(time.time() - start))
@@ -256,7 +282,7 @@ class ATES_obj:
         - The predicted recovery efficiency is obtained and stored in the instance variable Reff.
         """
         # Load the ML model
-        model = joblib.load("Predict_REFF_boostedregression.pkl")        
+        model = joblib.load(os.path.join(_HERE, "Predict_REFF_boostedregression.pkl"))
 
 
         # Prepare inputs for prediction
@@ -637,13 +663,8 @@ class ATES_obj:
                       "direct heating of return temperature, please consider the feasibility of this")
 
         # --- Temperature levels (set once, never mutated) -----------------------
-        self.T_return = T_cutoff                                    # HX floor
-        if self.HP is not None:
-            self.T_floor = max(T_cutoff - self.HP.delta_T_coldside, self.T_g)
-            if T_cutoff - self.HP.delta_T_coldside < self.T_g:
-                print(f"Warning: HP floor below ground temperature; clipped to T_g = {self.T_g}")
-        else:
-            self.T_floor = T_cutoff                                 # no HP -> nothing below the return
+        self.T_return = T_cutoff  # HX floor
+        self.T_floor = cold_well_T(T_cutoff, self.T_g, self.HP)
 
         # --- HP dispatch intent from main2 --------------------------------------
         if hp_on is None or self.HP is None:
@@ -773,7 +794,7 @@ class ATES_obj:
         self.cold_well_reff = reff
         self.cold_well_T_ave = T_ave
 
-    
+
     def calc_opex(self, kWh_generated):
         try:
             #opex = sum(self.flow_extracted)*self.var_opex

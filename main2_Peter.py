@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import joblib
 import pytest
-from ATES_obj_Peter import ATES_obj
+from ATES_obj_Peter import ATES_obj, cold_well_T
 from line_profiler import profile
 
 pytestmark = pytest.mark.filterwarnings("error::FutureWarning")
@@ -191,6 +191,12 @@ class demand_class:
                 excel_file = pd.read_excel(path,"Warmtevraag")
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]
+            elif example_demand == "Delft Peter":
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_50.6_GWh_parquet_Peter'
+                excel_file = pd.read_parquet(path)
+            # single-column file -> nothing to drop
+                excel_file = excel_file * 1000
+                self.data = np.transpose(np.array(excel_file))[0, :]
             elif example_demand == "TU Delft":
                 path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_parquet'
                 excel_file = pd.read_parquet(path)
@@ -347,7 +353,7 @@ class heat_pump_ATES:
     Calculate_COP(Tsink, Tsource), and a COP array the ATES writes into.
     """
     def __init__(self, power_el, delta_T_coldside,
-                 costperkW=1200, fixed_opex=50, elec_price=0.15,
+                 costperkW=1200, fixed_opex=50, elec_price=0.2,
                  lifetime=15, COP_max=5.0, CO2_kg_el=200,
                  M_supplier=0.02, tau_transport=0.0198, P_contract_kW=None,
                  VR_per_month=36.75, c_contract_per_kW_month=2.0228,
@@ -359,7 +365,7 @@ class heat_pump_ATES:
         self.power_el         = power_el          # [kW_el] fixed compressor rating
         self.delta_T_coldside = delta_T_coldside  # [K] fixed cooling below the DHN return
 
-        self.capex      = costperkW    # euro/kW
+        self.capex      = costperkW    # euro/kW HP CAPEX
         self.fixed_opex = fixed_opex   # euro/kW/yr
         self.elec_price = elec_price   # euro/kWh, flat fallback
         self.CO2_kg_el = CO2_kg_el  # gCO2/kWh grid intensity (flat; not hour-resolved)
@@ -470,7 +476,7 @@ class geothermal:
     """
     def __init__(self, flow_rate = None,power = None,costperkW = 1909, fixed_opex = 69,
                  var_opex = 0.0072, T_out = 90, depth = 2000,N_wells=2,lifetime = 30,
-                 heat_capacity_fluid = 4186, density_fluid = 997, CO2_kg=27):
+                 heat_capacity_fluid = 4186, density_fluid = 997, CO2_kg=12.5): #P: CO2_kg was 27; Changed to match Paper 3
         self.name = 'Geothermal well' #System name
         self.control = 'stable'       #Control system type
         self.type = 'supply'          #Heat supply t ype
@@ -545,8 +551,8 @@ class geothermal:
         return generated*self.CO2_kg
         
 class gas_boiler:
-    def __init__(self, power = 1000, eff = 0.93,costperkW = 100, gas_price = 0.1, 
-                 opexascapex = 0.02,lifetime = 15,CO2_kg = 200):
+    def __init__(self, power = 1000, eff = 0.93,costperkW = 100, gas_price = 0.055,
+                 opexascapex = 0.02,lifetime = 15,CO2_kg = 200): #P:gas_price was 0.01; Changed to match Paper 3
         self.name = 'Gas boiler'
         self.control = 'controlled'
         self.type = 'supply'
@@ -867,10 +873,11 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760, control = Non
         # Set equal to the level the discharge HP cools to (= T_floor in calc_heat),
         # so charging and discharging use the SAME cold-well temperature. Bounded
         # below by the ground temperature. No HP -> cold well stays at the return.
-        if storage_obj.HP is not None:
-            T_cold = max(demand.T_out - storage_obj.HP.delta_T_coldside, storage_obj.T_g)
-        else:
-            T_cold = demand.T_out
+        #if storage_obj.HP is not None:
+        #    T_cold = max(demand.T_out - storage_obj.HP.delta_T_coldside, storage_obj.T_g)
+        #else:
+        #    T_cold = demand.T_out
+        T_cold = cold_well_T(demand.T_out, storage_obj.T_g, storage_obj.HP)
         
         # For each supply connected to storage, check how much volume can go to the storage
         for i in storage_obj.supplier: 
@@ -1181,10 +1188,13 @@ def LCOE_calc_Yang(result,supply,df_eco,disc_rate=0.05,lifetime_system = 60,cape
             sum_cost = sum_cost+opex_network_perc*capex_network
     LCOE = sum_cost / generated
 
-    #sum_cost= sum_cost+piping_cost*piping_length
-    df_eco["LCOE_System"]= LCOE
-    LCOH_system = sum_cost/generated
-    return LCOH_system
+    # sum_cost= sum_cost+piping_cost*piping_length
+    df_eco["LCOE_System"] = LCOE
+    LCOH_system = sum_cost / generated
+    # 'generated' is the POOLED discounted heat, i.e. the shared denominator.
+    # Returned so a caller can decompose the numerator additively:
+    # contribution_i = cost_i / generated, and the parts sum to LCOH_system.
+    return LCOH_system, generated
 
 def LCOE_calc(result, supply, df_eco,disc_rate=0.05):
     """
@@ -1339,6 +1349,7 @@ def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=Fa
         CO2_df = CO2_emissions_calc(results_system, supply, CO2_price=CO2_price)
     for count, i in enumerate(supply):
         hp_capex = 0
+        opex_ATES_fixed = True #P: Done to get same results as David
         if i.name == "ATES":
             if opex_ATES_fixed:
                 try:
@@ -1355,9 +1366,15 @@ def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=Fa
                 elec_kWh = float(np.nansum(elec)) if elec is not None else 0.0  # compressor kWh/yr
                 hp_rating = getattr(hp, "rated_power", None) or hp.power_el  # kW
                 # Eq. 2 when an hourly spot series is attached, flat otherwise.
+                # Eq. 2 when an hourly spot series is attached, flat otherwise.
+                hp_elec_cost = hp.elec_cost(len_timestep=len_timestep)
+                hp_fix_cost = hp.fixed_opex * hp_rating
                 df_eco.loc[i.name, "opex"] = (df_eco.loc[i.name, "opex"]
-                                              + hp.elec_cost(len_timestep=len_timestep)
-                                              + hp.fixed_opex * hp_rating)  # HP fixed opex
+                                              + hp_elec_cost + hp_fix_cost)
+                # Stashed so a cost split can pull the HP back out of the merged
+                # ATES row. Diagnostic columns only -- the LCOH maths ignores them.
+                df_eco.loc[i.name, "hp_elec_cost"] = hp_elec_cost
+                df_eco.loc[i.name, "hp_fixopex"] = hp_fix_cost
                 hp_capex = 0.0  # hp.capex holds euro/kW  -> total euro
                 # The HP (hp.lifetime) is amortised inside the ATES row over i.lifetime.
                 # Buy a unit whenever the previous one expires, discounted to year 0, and
@@ -1368,6 +1385,7 @@ def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=Fa
                 for k in range(0, i.lifetime, hp.lifetime):
                     frac = min(hp.lifetime, i.lifetime - k) / hp.lifetime
                     hp_capex += (hp_rating * hp.capex * frac) / (1 + disc_rate) ** k
+                df_eco.loc[i.name, "hp_capex"] = hp_capex
 
         else:
             #df_eco["opex"].iloc[count] = i.calc_opex(sum(results_system[i.name + " corrected"]))
@@ -1410,10 +1428,8 @@ def system_plot(result, supply, demand, len_timestep = 3600,setting = "everythin
     # Fixed cold-well temperature, identical to system(): keeps the plotted storage
     # bands consistent with the Factor_due_HP the simulation actually used.
     # P: Change this once the loop regarding the cold well losses is improved! Changeplothere
-    if Storage and storage_obj.HP is not None:
-        T_cold = max(demand.T_out - storage_obj.HP.delta_T_coldside, storage_obj.T_g)
-    else:
-        T_cold = demand.T_out
+    T_cold = (cold_well_T(demand.T_out, storage_obj.T_g, storage_obj.HP)
+              if Storage else demand.T_out)
     for i in supply:
         if i.control == "stable":
             if Storage:
