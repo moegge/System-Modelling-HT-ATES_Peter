@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Test_File_Peter_17_08.py
+model_driver.py
 ==================================================================
 One simulation of the updated model (main2_Peter / ATES_obj_Peter), wrapped in
 run_case() so it can be run directly (single run) OR imported and called from a
@@ -26,7 +26,7 @@ hour.
 Run from the repo root (needs main2_Peter.py, ATES_obj_Peter.py, results_AXI_V2,
 Predict_REFF_boostedregression.pkl, and the Amsterdam demand parquet).
 
-    python Test_File_Peter_17_08.py            # single run, plots + Excel
+    python model_driver.py            # single run, plots + Excel
     from Test_File_Peter_17_08 import run_case  # driven by sweep.py
 ==================================================================
 """
@@ -57,7 +57,7 @@ CONFIG = None            # None -> derive from USE_HP; else one of
 TIMESTEP = 3600          # [s]
 
 # --- District-heating demand ----------------------------------------------
-DEMAND_EXAMPLE = "Amsterdam"
+DEMAND_EXAMPLE = "Amsterdam" #Amsterdam; Delft Peter; TU Delft
 DEMAND_T_IN    = 75      # [C] DHN supply temperature (HP condenser sink)
 DEMAND_T_OUT   = 55      # [C] DHN return temperature (= ATES cutoff / HX floor)
 
@@ -71,13 +71,16 @@ ATES_THICKNESS = 55      # [m]
 ATES_KH        = 10      # [m/day]
 ATES_ANI       = 5       # [-]
 ATES_T_GROUND  = 15      # [C]
+ATES_LIFETIME  = 30
 
 # --- Heat pump (only used if the config includes the HP) -------------------
 HP_POWER_EL         = 1500   # [kW_el] fixed compressor rating
 HP_DELTA_T_COLDSIDE = 20     # [K] cooling below the DHN return -> fixed cold-well T
 
-# --- CO2 price for the economics -------------------------------------------
+# --- Fuel and CO2 prices for the economics ---------------------------------
+GAS_PRICE = 0.055        # [euro/kWh_gas]
 CO2_PRICE = 150          # [euro/ton]
+ELEC_PRICE = 0.2         # [euro/kWh]
 
 # ================================================================== #
 
@@ -96,15 +99,112 @@ def _config_from_args(CONFIG, USE_HP):
         return c
     return "GGAH" if USE_HP else "GGA"
 
+# Must match what LCOE_calc_Yang is called with, below.
+DISC_RATE         = 0.05
+LIFETIME_SYSTEM   = 60
+LIFETIME_NETWORK  = 60
+OPEX_NETWORK_PERC = 0.02
+NETWORK_EUR_PER_M = 1157.0
+# than redeclaring, so the reported ratio_ATES_HP can never drift from the target.
+RHO_CP = 4180.0                  # [kJ/m3.K]
+
+
+def _cost_split(result, df_eco, supply, co2_df, generated_disc, capex_network,
+                hp_co2_eur):
+    """
+    Additive decomposition of the LCOE_calc_Yang system LCOH into [EUR/MWh].
+
+    Reproduces LCOE_calc_Yang's discounting component by component:
+      capex -> discounted at every reinvestment year (j % lifetime == 0)
+      opex  -> discounted every year j = 0 .. LIFETIME_SYSTEM-1
+    then divides each stream by the POOLED discounted heat, so the segments sum
+    to the system LCOH. This is NOT df_eco["LCOE"], which divides each component
+    by its OWN output and therefore sums to nothing.
+
+    NETWORK IS NOT DISCOUNTED here, because LCOE_calc_Yang adds the network
+    terms at face value while discounting everything else. Replicated on purpose
+    so the segments reconcile with the published figure.
+    """
+    if not generated_disc or not np.isfinite(generated_disc) or generated_disc <= 0:
+        return {}
+
+    r = DISC_RATE
+    af = sum(1.0 / (1.0 + r) ** j for j in range(LIFETIME_SYSTEM))
+
+    def _cap(capex, lifetime):
+        return sum(capex / (1.0 + r) ** j
+                   for j in range(0, LIFETIME_SYSTEM, max(int(lifetime), 1)))
+
+    def _val(name, col):
+        if col not in df_eco.columns or name not in df_eco.index:
+            return 0.0
+        return float(np.nan_to_num(df_eco.at[name, col]))
+
+    def _co2(name):
+        if co2_df is None or name not in co2_df.index:
+            return 0.0
+        return float(np.nan_to_num(co2_df.at[name, "Cost_CO2"]))
+
+    seg, co2_geo = {}, 0.0
+    for i in supply:
+        nm = i.name
+        if nm not in df_eco.index:
+            continue
+        capex, opex, co2 = _val(nm, "capex"), _val(nm, "opex"), _co2(nm)
+
+        if nm == "ATES":
+            # A NaN LCOE means LCOE_calc skipped it (nothing extracted), and
+            # LCOE_calc_Yang skipped it too -> no cost in the system figure.
+            if not np.isfinite(_val(nm, "LCOE")):
+                continue
+            hp_cap, hp_el = _val(nm, "hp_capex"), _val(nm, "hp_elec_cost")
+            hp_fix = _val(nm, "hp_fixopex")
+            seg["ATES well"] = (seg.get("ATES well", 0.0)
+                                + _cap(capex - hp_cap, i.lifetime)
+                                + (opex - co2 - hp_el - hp_fix) * af)
+            if hp_cap or hp_el:
+                seg["HP capex"] = _cap(hp_cap, i.lifetime)
+                seg["HP opex (elec + fixed)"] = (hp_el + hp_fix) * af
+                seg["CO2 - HP electricity"] = hp_co2_eur * af
+            # The ATES CO2 row carries the geothermal heat it stored PLUS the HP
+            # grid emissions; only the geothermal part belongs in the geo bucket.
+            co2_geo += max(co2 - hp_co2_eur, 0.0)
+        elif nm == "Geothermal well":
+            # Paper convention: the variable opex of the heat this plant sent to
+            # storage belongs to the ATES, not here. LCOE_calc reassigns it via
+            # add_opex_ATES; LCOE_calc_Yang does not, so do it in the split.
+            # Moves cost between two segments -- the total is unchanged.
+            pct, prod = nm + " percentage to storage", nm + " production"
+            stored = (float(np.nan_to_num((result[pct] * result[prod]).sum()))
+                      if pct in result and prod in result else 0.0)
+            to_ates = getattr(i, "var_opex", 0.0) * stored
+            seg["Geothermal"] = _cap(capex, i.lifetime) + (opex - co2 - to_ates) * af
+            seg["ATES well"] = seg.get("ATES well", 0.0) + to_ates * af
+            co2_geo += co2
+        elif nm == "Gas boiler":
+            seg["Gas boiler"] = _cap(capex, i.lifetime) + (opex - co2) * af
+            seg["CO2 - gas"] = co2 * af
+        else:
+            seg[nm] = _cap(capex, i.lifetime) + (opex - co2) * af
+    if co2_geo:
+        seg["CO2 - geothermal"] = co2_geo * af
+
+    if capex_network:
+        seg["Network"] = (len(range(0, LIFETIME_SYSTEM, LIFETIME_NETWORK))
+                          * capex_network
+                          + LIFETIME_SYSTEM * OPEX_NETWORK_PERC * capex_network)
+
+    return {k: v / generated_disc * 1000.0 for k, v in seg.items()}
 
 def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
              DEMAND_EXAMPLE=DEMAND_EXAMPLE, DEMAND_T_IN=DEMAND_T_IN, DEMAND_T_OUT=DEMAND_T_OUT,
              GEO_POWER=GEO_POWER, GEO_T_OUT=GEO_T_OUT,
              ATES_MAX_V=ATES_MAX_V, ATES_THICKNESS=ATES_THICKNESS, ATES_KH=ATES_KH,
              ATES_ANI=ATES_ANI, ATES_T_GROUND=ATES_T_GROUND,
+             ATES_LIFETIME=ATES_LIFETIME,
              HP_POWER_EL=HP_POWER_EL, HP_DELTA_T_COLDSIDE=HP_DELTA_T_COLDSIDE,
              HP_DYNAMIC_DISPATCH=False, HP_THRESHOLD_EUR_MWH=60.0,
-             CO2_PRICE=CO2_PRICE,
+             GAS_PRICE=GAS_PRICE, CO2_PRICE=CO2_PRICE, ELEC_PRICE=ELEC_PRICE, NETWORK_LENGTH_M=0.0,
              OUTFILE=None, tag="",
              make_plots=False, write_excel=True):
     """
@@ -137,19 +237,20 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     # --- District-heating components ------------------------------------------
     demand = demand_class(T_in=DEMAND_T_IN, T_out=DEMAND_T_OUT,
                           example_demand=DEMAND_EXAMPLE)
-    gas    = gas_boiler()
+    gas    = gas_boiler(gas_price=GAS_PRICE)
 
     # Geothermal is present in GG / GGA / GGAH (charging source for the ATES too).
     geo = geothermal(power=GEO_POWER, T_out=GEO_T_OUT) if use_geo else None
 
     # Heat pump only in GGAH.
-    hp = (heat_pump_ATES(power_el=HP_POWER_EL, delta_T_coldside=HP_DELTA_T_COLDSIDE)
+    hp = (heat_pump_ATES(power_el=HP_POWER_EL, delta_T_coldside=HP_DELTA_T_COLDSIDE, elec_price=ELEC_PRICE)
           if use_hp else None)
 
     # ATES only in GGA / GGAH; it charges from the geothermal supplier.
     if use_ates:
         ATES = ATES_obj([geo], max_V=ATES_MAX_V, thickness=ATES_THICKNESS,
-                        kh=ATES_KH, ani=ATES_ANI, T_ground=ATES_T_GROUND, HP=hp)
+                        kh=ATES_KH, ani=ATES_ANI, T_ground=ATES_T_GROUND,
+                        lifetime=ATES_LIFETIME, HP=hp, elec_price=ELEC_PRICE)
     else:
         ATES = None
 
@@ -178,9 +279,14 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         system_plot(result, supply, demand, len_timestep=timestep, setting="ordered")
 
     # --- Economics (LCOH per component) ----------------------------------------
-    df_eco = economic_analysis(result, supply, incorporate_CO2=True, CO2_price=CO2_PRICE,
+    df_eco = economic_analysis(result, supply, disc_rate=DISC_RATE,
+                               incorporate_CO2=True, CO2_price=CO2_PRICE,
                                len_timestep=timestep)
-    system_lcoh_yang = LCOE_calc_Yang(result, supply, df_eco, lifetime_system=60)
+    capex_network_eur = NETWORK_LENGTH_M * NETWORK_EUR_PER_M
+    system_lcoh_yang, generated_disc = LCOE_calc_Yang(
+        result, supply, df_eco, disc_rate=DISC_RATE,
+        lifetime_system=LIFETIME_SYSTEM, capex_network=capex_network_eur,
+        opex_network_perc=OPEX_NETWORK_PERC, lifetime_network=LIFETIME_NETWORK)
     print("\nLCOH per component:")
     for i in range(len(df_eco)):
         print(f"  {df_eco.iloc[i, 0]:<16} = {round(df_eco.iloc[i].loc['LCOE'], 3)} euro/kWh")
@@ -386,6 +492,20 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         print(f"(CO2 breakdown skipped: {type(e).__name__}: {e})")
         co2_df = None
 
+    # --- Additive cost split of the system LCOH [EUR/MWh] ----------------------
+    hp_co2_eur = 0.0
+    if hp_obj is not None:
+        try:    # calc_emissions returns grams; CO2_PRICE is EUR/tonne
+            hp_co2_eur = float(hp_obj.calc_emissions(result)) / 1e6 * CO2_PRICE
+        except Exception:
+            hp_co2_eur = 0.0
+    cost_split = _cost_split(result, df_eco, supply, co2_df, generated_disc,
+                             capex_network_eur, hp_co2_eur)
+    if cost_split:
+        print(f"  cost split residual: "
+              f"{sum(cost_split.values()) - system_lcoh_yang * 1000.0:+.4f} "
+              f"EUR/MWh (should be ~0)")
+
     def _co2_kg(k):  return co2_df.at[k, "CO2_emission [kg]"] if (co2_df is not None and k in co2_df.index) else np.nan
     def _co2_eur(k): return co2_df.at[k, "Cost_CO2"]         if (co2_df is not None and k in co2_df.index) else np.nan
 
@@ -417,17 +537,13 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         }])
         eco_tbl = pd.concat([eco_tbl, hp_row], ignore_index=True)
 
-    # System LCOH: generation-weighted blend of the component LCOHs (approximate;
-    # the rigorous system figure is LCOE_calc_Yang, not called here).
-    gens = np.array([df_eco.at[k, "generated discounted"] for k in df_eco.index], dtype=float)
-    lcoh = np.array([df_eco.at[k, "LCOE"] for k in df_eco.index], dtype=float)
-    m = np.isfinite(gens) & np.isfinite(lcoh) & (gens > 0)
-    system_lcoh = float(np.nansum(gens[m] * lcoh[m]) / np.nansum(gens[m])) if m.any() else np.nan #P: this is (probably) the old blend LCOE calculation; remove
+    # System LCOH = LCOE_calc_Yang (pooled discounted cost / heat, 60-yr horizon),
+    # computed above. The old generation-weighted blend has been removed.
 
     summary_tbl = pd.DataFrame({
         "Metric": [
             "Config",
-            "System LCOH (generation-weighted) [euro/kWh]",
+            "System LCOH (Yang, 60-yr horizon) [euro/kWh]",
             "Total CO2 [t/yr]",
             "Total CO2 cost [euro/yr]",
             "HP rated power [kW]",
@@ -442,7 +558,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         ],
         "Value": [
             cfg,
-            system_lcoh,
+            system_lcoh_yang,
             (co2_df["CO2_emission [kg]"].sum() / 1000) if co2_df is not None else np.nan,
             co2_df["Cost_CO2"].sum() if co2_df is not None else np.nan,
             hp_rating_kW,
@@ -599,7 +715,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
 
     print("\nEconomic analysis:")
     print(df_eco.to_string())
-    print(f"\n  System LCOH (generation-weighted) : {system_lcoh:.4f} euro/kWh")
+    print(f"\n  System LCOH (Yang, 60-yr)         : {system_lcoh_yang:.4f} euro/kWh")
     if co2_df is not None:
         print(f"  Total CO2                         : "
               f"{co2_df['CO2_emission [kg]'].sum() / 1000:,.1f} t/yr "
@@ -620,7 +736,6 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     # power of a freshly-charged well (charged to the geo supply temperature,
     # delivering down to the DHN return). Compared against the HP electrical
     # rating -> a fixed, COP-independent sizing metric.
-    RHO_CP = 4180.0                      # [kJ/m3.K] water
     if use_ates:
         ates_nominal_kW = (ATES_MAX_V / 3600.0) * RHO_CP * (GEO_T_OUT - DEMAND_T_OUT)
     else:
@@ -636,6 +751,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         "GEO_POWER": GEO_POWER if use_geo else 0.0,
         "GD_ratio": gd_ratio,
         "ATES_MAX_V": ATES_MAX_V if use_ates else np.nan,
+        "ATES_LIFETIME": ATES_LIFETIME if use_ates else np.nan,
         "HP_POWER_EL": HP_POWER_EL if use_hp else np.nan,
         "HP_DELTA_T_COLDSIDE": HP_DELTA_T_COLDSIDE if use_hp else np.nan,
         "dynamic_dispatch": bool(HP_DYNAMIC_DISPATCH and use_hp),
@@ -653,8 +769,8 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         "hp_GWh": hp_corr.sum() / GWh,
         "gas_GWh": gas_corr.sum() / GWh,
         "unmet_GWh": float(np.clip(result["Demand"] - result["Total production"], 0, None).sum() / GWh),
-        "system_lcoh": system_lcoh,
         "system_lcoh_yang": system_lcoh_yang,
+        "cost_split": cost_split,
         "geo_lcoh": df_eco.at["Geothermal well", "LCOE"] if "Geothermal well" in df_eco.index else np.nan,
         "ates_lcoh": df_eco.at["ATES", "LCOE"] if "ATES" in df_eco.index else np.nan,
         "gas_lcoh": df_eco.at["Gas boiler", "LCOE"] if "Gas boiler" in df_eco.index else np.nan,

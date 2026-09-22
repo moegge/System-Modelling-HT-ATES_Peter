@@ -192,21 +192,21 @@ class demand_class:
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]
             elif example_demand == "TU Delft":
-                path = r'C:\Users\6100430\OneDrive - Universiteit Utrecht\PhD project\PhD python\Warmtevraag_Delft_parquet'
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_parquet'
                 excel_file = pd.read_parquet(path)
                 #excel_file = pd.read_excel(path,"Warmtevraag")
                 excel_file.drop(["Demand Total","Demand OWD"],inplace=True,axis=1)
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]
             elif example_demand == "Delft City":
-                path = r'C:\Users\6100430\OneDrive - Universiteit Utrecht\PhD project\PhD python\Warmtevraag_Delft_parquet'
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_parquet'
                 excel_file = pd.read_parquet(path)
                 #excel_file = pd.read_excel(path,"Warmtevraag")
                 excel_file.drop(["Demand Total","Demand TUD"],inplace=True,axis=1)
                 excel_file = excel_file * 1000
                 self.data=np.transpose(np.array(excel_file))[0,:]        
             elif example_demand == "Delft Total":
-                path = r'C:\Users\6100430\OneDrive - Universiteit Utrecht\PhD project\PhD python\Warmtevraag_Delft_parquet'
+                path = r'C:\Users\0527831\PycharmProjects\System-Modelling-HT-ATES_Peter\Data_and_scripts\Demand_data\Warmtevraag_Delft_parquet'
                 excel_file = pd.read_parquet(path)
                 #excel_file = pd.read_excel(path,"Warmtevraag")
                 excel_file.drop(["Demand OWD","Demand TUD"],inplace=True,axis=1)
