@@ -5,11 +5,18 @@ BTES_obj_Peter.py
 Borehole Thermal Energy Storage (BTES) object for main2_Peter.system().
 
 Drop-in replacement for ATES_obj_Peter.ATES_obj / MTES_obj_Peter.MTES_obj when
-the seasonal storage is a field of closed-loop borehole heat exchangers (U-tubes
-in grouted boreholes) instead of an aquifer or a flooded mine. It exposes the
-SAME attributes and methods that main2_Peter.system(), economic_analysis(),
-LCOE_calc() and system_plot() use on the storage object, so the rest of the
-model does not care which technology sits in the storage slot.
+the seasonal storage is a field of closed-loop borehole heat exchangers
+(coaxial pipes or U-tubes in grouted boreholes) instead of an aquifer or a
+flooded mine. It exposes the SAME attributes and methods that
+main2_Peter.system(), economic_analysis(), LCOE_calc() and system_plot() use on
+the storage object, so the rest of the model does not care which technology
+sits in the storage slot.
+
+DEFAULTS = DARMSTADT (SKEWS medium-deep BTES, TU Darmstadt, Lichtwiese campus):
+3 coaxial borehole heat exchangers, 750 m deep, in a triangle (built 8.6 m
+apart; the model uses 2.5 m, B_SPACING),
+~9.25 m3/h max flow each (measured, first operating year). See the BTES
+PARAMETERS block; every value is tagged with where it comes from.
 
 PHYSICS  (pygfunction, https://github.com/MassimoCimmino/pygfunction)
 -------
@@ -22,9 +29,12 @@ PHYSICS  (pygfunction, https://github.com/MassimoCimmino/pygfunction)
            pygfunction.load_aggregation.ClaesKallstrom), so a multi-year hourly
            run stays fast. aggregation_error() checks it against the exact
            superposition.
-  borehole pygfunction pipe model (SingleUTube / MultipleUTube, multipole
-           method) -> heat-exchanger effectiveness of ONE borehole as a function
-           of its flow, tabulated once in __init__:
+  layout   "triangular": N boreholes on a triangular grid of spacing B, the N
+           closest to the field centre (3 -> triangle, 7 / 19 / 37 -> hexagon,
+           i.e. the SKEWS expansion stages). "rectangle": N_x * N_y grid.
+  borehole pygfunction pipe model (Coaxial / SingleUTube / MultipleUTube,
+           multipole method) -> heat-exchanger effectiveness of ONE borehole
+           as a function of its flow, tabulated once in __init__:
                eps(m_b) = (T_in - T_out) / (T_in - T_b)
            All boreholes are in PARALLEL and share the same wall temperature
            (boundary condition UBWT), so the field effectiveness equals the
@@ -101,17 +111,24 @@ those tests to `i.control == "storage"` (and `result["ATES corrected"]` to
 MODEL LIMITS (built into the g-function method)
 -----------------------------------------------
   - homogeneous ground (one k_s, one rho*c_s), no layers
-  - NO groundwater flow (advection). Relevant in Dutch sandy layers.
+  - ONE undisturbed ground temperature: the geothermal gradient is replaced by
+    its average over the borehole depth (T_GROUND below)
+  - NO groundwater flow (advection); fractures / faults not represented
   - ground surface held at T_g: a top insulation layer is NOT modelled
-    (only approximated through the buried depth D)
+    (only approximated through the buried depth D; minor for 750 m boreholes)
   - constant properties, no moisture migration / drying out at high T
   - borehole and grout thermal capacity neglected (fine at hourly steps)
   - all boreholes in parallel, one mean wall temperature (no centre-to-edge
     stratification, no series-connected strings)
+  - coaxial: one flow direction for charging AND discharging (inlet = inner
+    pipe); the real reversal between seasons is not modelled
 
-Values typical for shallow Dutch ground / standard BHE design are flagged
-[TYPICAL]; choices copied from ATES_obj_Peter / MTES_obj_Peter for
-comparability [ATES-PARITY]; everything else is [ASSUMED].
+Value origins in the parameter block:
+  [DATA]        Darmstadt measurements, first operating year (from Peter)
+  [SKEWS]       published SKEWS project information (TU Darmstadt)
+  [TYPICAL]     textbook / standard BHE design values
+  [ATES-PARITY] copied from ATES_obj_Peter / MTES_obj_Peter for comparability
+  [ASSUMED]     placeholder, to be checked
 ==================================================================
 """
 import hashlib
@@ -152,26 +169,42 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 N_YEARS = 10
 
 # --- Borefield geometry (g) -------------------------------------------------
-N_X        = 20       # [-]  boreholes along x           -> N_b = N_X * N_Y   [ASSUMED]
-N_Y        = 20       # [-]  boreholes along y                                  [ASSUMED]
-B_SPACING  = 3.0      # [m]  borehole spacing (storage: 2-4 m)                  [TYPICAL]
-H_BOREHOLE = 50.0     # [m]  active borehole length (storage: 30-100 m)         [TYPICAL]
-D_BURIED   = 2.0      # [m]  buried depth of the borehole top                   [TYPICAL]
-R_BOREHOLE = 0.075    # [m]  borehole radius (150 mm drill diameter)            [TYPICAL]
+LAYOUT      = "triangular"  # "triangular" (N_BOREHOLES on a triangular grid) or
+                            # "rectangle" (N_X * N_Y grid)
+N_BOREHOLES = 37        # [-]  triangular layout: 3 built; 19 / 37 planned stages   [SKEWS]
+N_X         = 20       # [-]  rectangle layout only: boreholes along x
+N_Y         = 20       # [-]  rectangle layout only: boreholes along y
+B_SPACING   = 2.5      # [m]  borehole spacing (SKEWS pilot: 8.6 m)               [ASSUMED]
+H_BOREHOLE  = 750.0    # [m]  borehole length                                      [SKEWS]
+D_BURIED    = 1.0      # [m]  buried depth of the borehole top                     [ASSUMED]
+R_BOREHOLE  = 0.108    # [m]  borehole radius (8 1/2" = 216 mm drill bit)          [ASSUMED]
 
-# --- Ground -----------------------------------------------------------------
-K_GROUND      = 2.0     # [W/mK]   thermal conductivity (sat. sand/clay 1.5-2.5) (g) [TYPICAL]
-RHO_CP_GROUND = 2.4e6   # [J/m3K]  volumetric heat capacity (2.0-2.8e6)          (g) [TYPICAL]
-T_GROUND      = 10.0    # [C]      undisturbed ground temperature (NL ~10-12)        [ATES-PARITY]
+# --- Ground (Darmstadt: crystalline basement of the Odenwald) --------------
+K_GROUND      = 2.8     # [W/mK]   thermal conductivity (crystalline 2.5-3.2)   (g) [ASSUMED]
+RHO_CP_GROUND = 2.3e6   # [J/m3K]  volumetric heat capacity (2.1-2.5e6)          (g) [ASSUMED]
+#  The g-function method takes ONE undisturbed temperature. With a geothermal
+#  gradient the ground warms with depth, so the average over the borehole
+#  (mid-depth D + H/2) is used: 11 + 0.03 * 376 ~ 22.3 C.
+T_SURFACE     = 11.0    # [C]      mean annual surface temperature, Darmstadt      [ASSUMED]
+GEO_GRADIENT  = 0.03    # [K/m]    geothermal gradient (continental average)       [ASSUMED]
+T_GROUND      = T_SURFACE + GEO_GRADIENT * (D_BURIED + H_BOREHOLE / 2)   # [C] depth average
 
 # --- Borehole internals (set R_b / effectiveness, NOT the g-function) -------
-PIPE_TYPE      = "single_U"   # "single_U" or "double_U" (double: 2 U-tubes in parallel)
-R_PIPE_OUT     = 0.016        # [m]    pipe outer radius (32 mm pipe)             [TYPICAL]
-R_PIPE_IN      = 0.0131       # [m]    pipe inner radius (SDR 11 -> 2.9 mm wall)  [TYPICAL]
-D_SHANK        = 0.035        # [m]    pipe centre to borehole centre             [TYPICAL]
-K_PIPE         = 0.40         # [W/mK] pipe wall (PE-RT / PE-X for high T)        [TYPICAL]
-K_GROUT        = 1.5          # [W/mK] thermally enhanced grout                    [TYPICAL]
-PIPE_ROUGHNESS = 1.0e-6       # [m]    pipe roughness (smooth plastic)             [TYPICAL]
+PIPE_TYPE      = "coaxial"    # "coaxial", "single_U" or "double_U"
+PIPE_ROUGHNESS = 1.0e-6       # [m]    pipe roughness (smooth)                     [TYPICAL]
+K_GROUT        = 1.5          # [W/mK] grout / cement between casing and rock      [ASSUMED]
+#  Coaxial: water goes down the inner pipe and up the annulus (inlet = inner pipe).
+R_INNER_IN     = 0.0375       # [m]    inner pipe, inner radius (0.075 m ID)       [DATA]
+R_INNER_OUT    = 0.045        # [m]    inner pipe, outer radius (PE 90 mm, SDR 11) [ASSUMED]
+K_INNER        = 0.40         # [W/mK] inner pipe wall (PE, insulating)            [ASSUMED]
+R_OUTER_IN     = 0.0622       # [m]    outer pipe (casing), inner radius           [ASSUMED]
+R_OUTER_OUT    = 0.06985      # [m]    outer pipe (casing), outer radius (5 1/2")  [ASSUMED]
+K_OUTER        = 45.0         # [W/mK] outer pipe wall (steel casing)              [ASSUMED]
+#  U-tubes (only used with PIPE_TYPE = "single_U" / "double_U"):
+R_PIPE_OUT     = 0.016        # [m]    pipe outer radius (32 mm pipe)              [TYPICAL]
+R_PIPE_IN      = 0.0131       # [m]    pipe inner radius (SDR 11 -> 2.9 mm wall)   [TYPICAL]
+D_SHANK        = 0.035        # [m]    pipe centre to borehole centre              [TYPICAL]
+K_PIPE         = 0.40         # [W/mK] pipe wall (PE-RT / PE-X for high T)         [TYPICAL]
 
 # --- Heat-transfer fluid (water) ----------------------------------------------
 RHO_FLUID = 997.0      # [kg/m3]  density                                         [ATES-PARITY]
@@ -180,15 +213,20 @@ MU_FLUID  = 5.5e-4     # [Pa s]   dynamic viscosity (water ~50 C)               
 K_FLUID   = 0.64       # [W/mK]   thermal conductivity (water ~50 C)              [TYPICAL]
 
 # --- Operation --------------------------------------------------------------
-MAX_V           = 150.0  # [m3/h] field pump rating: most water through the field per hour [ATES-PARITY]
+#  Field pump rating max_V [m3/h] = per-borehole max flow * number of boreholes,
+#  so it scales with the SKEWS expansion stages. Measured maxima (first year):
+#  BHE2 221.8, BHE3 221.5, BHE4 213.8 m3/day -> 9.24 / 9.23 / 8.91 m3/h
+#  (averages ~4.9 m3/h each). 9.25 m3/h = 2.57 l/s = 0.58 m/s in the 0.075 m
+#  inner pipe. Pass max_V=... to BTES_obj to set the field rating directly.
+MAX_V_PER_BOREHOLE = 9.25  # [m3/h] max flow per borehole heat exchanger          [DATA]
 MIN_DT_EXTRACT  = 0.0    # [K]  wall must be this far above the return T to discharge [ASSUMED]
 MIN_USEFUL_KW   = 20.0   # [kW] pump only starts if a full-flow pass delivers this much [ASSUMED]
 PUMP_HEAD       = 30.0   # [m]  pressure head of field + headers, for pump electricity  [ASSUMED]
 PUMP_EFFICIENCY = 0.5    # [-]  overall pump efficiency                              [ATES-PARITY]
 
 # --- Economics of the BTES itself (HP, prices, LCOE maths stay in main2) -----
-COST_PER_M      = 70.0   # [euro/m drilled] drilling + U-tube + grout             [ASSUMED]
-CAPEX_FIXED     = 0.0    # [euro] headers, manifolds, top insulation, connection    [ASSUMED]
+COST_PER_M      = 1000.0 # [euro/m drilled] medium-deep drilling + casing + coax  [ASSUMED: PLACEHOLDER]
+CAPEX_FIXED     = 0.0    # [euro] headers, manifolds, connection                   [ASSUMED]
 FIXED_OPEX_FRAC = 0.01   # [1/yr] fixed OPEX as a share of CAPEX                   [ASSUMED]
 VAR_OPEX        = 2 / 40 # [euro/kWh] kept for interface parity                    [ATES-PARITY]
 LIFETIME        = 50     # [yr] borehole heat exchangers                           [ASSUMED]
@@ -202,7 +240,9 @@ GFUNC_T_MIN      = 300.0         # [s]  first time of the g-function grid       
 GFUNC_T_MAX_YR   = 200.0         # [yr] last time of the g-function grid             (g)
 GFUNC_N_TIMES    = 60            # [-]  log-spaced grid points (g interpolated in ln t) (g)
 USE_GFUNC_CACHE  = True          # re-use g-functions stored in BTES/gfunction_cache
-CELLS_PER_LEVEL  = 5             # load aggregation: cells per level (5 = pygfunction default)
+CELLS_PER_LEVEL  = 20            # load aggregation: cells per level (pygfunction default 5).
+                                 # 20 halves the error under hard on/off switching
+                                 # (37 BHE: 3.1 -> 2.1 K max) at no measurable extra runtime.
 N_EPS_TABLE      = 30            # flow points of the effectiveness table
 # ====================================================================== #
 
@@ -219,6 +259,40 @@ _AQUIFER_ONLY_KWARGS = {"thickness", "porosity", "kh", "ani", "N_wells",
 _NO_DISCHARGE = (0.0, 0.0, 0.0, 0.0, np.nan, 0.0, np.nan, np.nan, 0.0, False)
 
 
+def _pygfunction_version():
+    """Installed pygfunction version (part of the g-function cache key)."""
+    try:
+        from importlib.metadata import version
+        return version("pygfunction")
+    except Exception:
+        return "?"
+
+
+def triangular_field_coordinates(N, B):
+    """
+    (x, y) of N boreholes on a triangular grid with spacing B [m]: the N grid
+    points closest to the field centre, so the field is as compact as possible.
+    Centred hexagonal numbers (1, 7, 19, 37, 61, ...) are centred on a borehole
+    and give a hexagon; any other N is centred on a triangle centroid (N = 3 ->
+    one equilateral triangle, as built in Darmstadt).
+    """
+    N = int(N)
+    if N < 1:
+        raise ValueError("N_boreholes must be >= 1")
+    k = 0
+    while 1 + 3 * k * (k + 1) < N:
+        k += 1
+    hexagonal = (1 + 3 * k * (k + 1) == N)
+    centre = (0.0, 0.0) if hexagonal else (B / 2, B * np.sqrt(3) / 6)
+    m = k + 2
+    pts = [(B * (i + j / 2), B * j * np.sqrt(3) / 2)
+           for i in range(-m, m + 1) for j in range(-m, m + 1)]
+    # Sort by distance to the centre, ties by angle, so the choice is reproducible.
+    pts.sort(key=lambda p: (round(math.hypot(p[0] - centre[0], p[1] - centre[1]), 9),
+                            round(math.atan2(p[1] - centre[1], p[0] - centre[0]), 9)))
+    return [(x - centre[0], y - centre[1]) for x, y in pts[:N]]
+
+
 class BTES_obj:
     """
     Borehole Thermal Energy Storage: pygfunction g-function + load aggregation
@@ -229,25 +303,43 @@ class BTES_obj:
     supplier : list
         Supply objects that charge the storage (e.g. [geothermal]). main2 uses it
         to route surplus heat; calc_emissions uses it for the embodied CO2.
+    layout : str
+        "triangular" (N_boreholes on a triangular grid, see
+        triangular_field_coordinates) or "rectangle" (N_x * N_y grid).
+    N_boreholes : int
+        Number of boreholes for the triangular layout (3 built in Darmstadt).
     N_x, N_y : int
-        Rectangular field of N_x * N_y boreholes.
+        Rectangular layout only: field of N_x * N_y boreholes.
     B, H, D, r_b : float
         Spacing, active length, buried depth and radius of the boreholes [m].
     k_s, rho_cp_s : float
         Ground conductivity [W/mK] and volumetric heat capacity [J/m3K].
-    T_ground : float
-        Undisturbed ground temperature [C]. Read by main2 as .T_g for the HP
-        cold side.
+    T_ground : float or None
+        Undisturbed ground temperature [C]. None (default) -> the depth average
+        T_surface + geo_gradient * (D + H / 2), so it follows H in a sweep.
+        Read by main2 as .T_g for the HP cold side.
+    T_surface, geo_gradient : float
+        Mean surface temperature [C] and geothermal gradient [K/m], used only
+        when T_ground is None.
     pipe_type : str
-        "single_U" or "double_U".
-    r_in, r_out, D_s, k_p, k_g, epsilon : float
-        Pipe radii [m], shank spacing (pipe centre to borehole centre) [m], pipe
-        and grout conductivity [W/mK], pipe roughness [m].
+        "coaxial", "single_U" or "double_U".
+    r_inner_in, r_inner_out, k_inner : float
+        Coaxial: inner pipe radii [m] and wall conductivity [W/mK].
+    r_outer_in, r_outer_out, k_outer : float
+        Coaxial: outer pipe (casing) radii [m] and wall conductivity [W/mK].
+    r_in, r_out, D_s, k_p : float
+        U-tubes: pipe radii [m], shank spacing (pipe centre to borehole centre)
+        [m], pipe conductivity [W/mK].
+    k_g, epsilon : float
+        Grout conductivity [W/mK], pipe roughness [m].
     density_fluid, heat_capacity_fluid, mu_fluid, k_fluid : float
         Water properties [kg/m3], [J/kgK], [Pa s], [W/mK].
-    max_V : float
+    max_V_per_borehole : float
+        Max flow per borehole [m3/h]; the field rating is this times N_b.
+    max_V : float or None
         Field pump rating [m3/h]: the most water through the field per hour,
-        charging or discharging. main2 caps flow_injected with it.
+        charging or discharging. main2 caps flow_injected with it. None
+        (default) -> max_V_per_borehole * N_b.
     min_dT_extract : float
         Discharge only if the wall is at least this much [K] above the
         temperature the loop water returns at. 0 = ideal surface HX.
@@ -302,17 +394,23 @@ class BTES_obj:
 
     def __init__(self, supplier,
                  # --- borefield geometry -------------------------------------------
-                 N_x=N_X, N_y=N_Y, B=B_SPACING, H=H_BOREHOLE, D=D_BURIED, r_b=R_BOREHOLE,
+                 layout=LAYOUT, N_boreholes=N_BOREHOLES, N_x=N_X, N_y=N_Y,
+                 B=B_SPACING, H=H_BOREHOLE, D=D_BURIED, r_b=R_BOREHOLE,
                  # --- ground -------------------------------------------------------
-                 k_s=K_GROUND, rho_cp_s=RHO_CP_GROUND, T_ground=T_GROUND,
+                 k_s=K_GROUND, rho_cp_s=RHO_CP_GROUND, T_ground=None,
+                 T_surface=T_SURFACE, geo_gradient=GEO_GRADIENT,
                  # --- borehole internals -------------------------------------------
-                 pipe_type=PIPE_TYPE, r_in=R_PIPE_IN, r_out=R_PIPE_OUT, D_s=D_SHANK,
-                 k_p=K_PIPE, k_g=K_GROUT, epsilon=PIPE_ROUGHNESS,
+                 pipe_type=PIPE_TYPE,
+                 r_inner_in=R_INNER_IN, r_inner_out=R_INNER_OUT, k_inner=K_INNER,
+                 r_outer_in=R_OUTER_IN, r_outer_out=R_OUTER_OUT, k_outer=K_OUTER,
+                 r_in=R_PIPE_IN, r_out=R_PIPE_OUT, D_s=D_SHANK, k_p=K_PIPE,
+                 k_g=K_GROUT, epsilon=PIPE_ROUGHNESS,
                  # --- fluid --------------------------------------------------------
                  density_fluid=RHO_FLUID, heat_capacity_fluid=CP_FLUID,
                  mu_fluid=MU_FLUID, k_fluid=K_FLUID,
                  # --- operation ----------------------------------------------------
-                 max_V=MAX_V, min_dT_extract=MIN_DT_EXTRACT, min_useful_kW=MIN_USEFUL_KW,
+                 max_V_per_borehole=MAX_V_PER_BOREHOLE, max_V=None,
+                 min_dT_extract=MIN_DT_EXTRACT, min_useful_kW=MIN_USEFUL_KW,
                  pump_head=PUMP_HEAD, pump_efficiency=PUMP_EFFICIENCY,
                  # --- economics ----------------------------------------------------
                  cost_per_m=COST_PER_M, capex_fixed=CAPEX_FIXED,
@@ -345,27 +443,51 @@ class BTES_obj:
             t0 = time.time()
 
         # --- Borefield geometry ---------------------------------------------------
-        self.N_x, self.N_y = int(N_x), int(N_y)
-        self.N_b = self.N_x * self.N_y                   # number of boreholes
         self.B, self.H, self.D, self.r_b = float(B), float(H), float(D), float(r_b)
+        self.layout = layout
+        if layout == "triangular":
+            self.coords = triangular_field_coordinates(N_boreholes, self.B)
+            self.N_x = self.N_y = None
+            # Every borehole "owns" a hexagon of area (sqrt(3)/2) B^2.
+            area = len(self.coords) * np.sqrt(3) / 2 * self.B ** 2
+        elif layout == "rectangle":
+            self.N_x, self.N_y = int(N_x), int(N_y)
+            self.coords = [(i * self.B, j * self.B)
+                           for j in range(self.N_y) for i in range(self.N_x)]
+            # Every borehole "owns" a B x B square.
+            area = len(self.coords) * self.B ** 2
+        else:
+            raise ValueError(f"layout must be 'triangular' or 'rectangle', got {layout!r}")
+        self.N_b = len(self.coords)                      # number of boreholes
         self.H_tot = self.N_b * self.H                   # m drilled (active)
-        # Storage volume: every borehole "owns" a B x B column of ground.
-        self.V_ground = (self.N_x * self.B) * (self.N_y * self.B) * self.H   # m3
+        self.V_ground = area * self.H                    # m3, storage volume (reporting only)
 
         # --- Ground -----------------------------------------------------------------
         self.k_s = float(k_s)                            # W/mK
         self.rho_cp_s = float(rho_cp_s)                  # J/m3K
         self.alpha = self.k_s / self.rho_cp_s            # m2/s
         self.t_s = self.H ** 2 / (9 * self.alpha)        # s, characteristic time
+        self.T_surface = float(T_surface)                # C
+        self.geo_gradient = float(geo_gradient)          # K/m
+        if T_ground is None:                             # depth average over the borehole
+            T_ground = self.T_surface + self.geo_gradient * (self.D + self.H / 2)
         self.T_g = float(T_ground)                       # C
         self.C_ground_kWh_per_K = self.V_ground * self.rho_cp_s / 3.6e6
 
         # --- Borehole internals and fluid ---------------------------------------------
-        if pipe_type not in ("single_U", "double_U"):
-            raise ValueError(f"pipe_type must be 'single_U' or 'double_U', got {pipe_type!r}")
+        if pipe_type not in ("coaxial", "single_U", "double_U"):
+            raise ValueError(f"pipe_type must be 'coaxial', 'single_U' or 'double_U', "
+                             f"got {pipe_type!r}")
         self.pipe_type = pipe_type
+        self.r_inner_in, self.r_inner_out = float(r_inner_in), float(r_inner_out)
+        self.r_outer_in, self.r_outer_out = float(r_outer_in), float(r_outer_out)
+        self.k_inner, self.k_outer = float(k_inner), float(k_outer)
         self.r_in, self.r_out, self.D_s = float(r_in), float(r_out), float(D_s)
         self.k_p, self.k_g, self.epsilon = float(k_p), float(k_g), float(epsilon)
+        if pipe_type == "coaxial" and not (self.r_inner_in < self.r_inner_out
+                                           < self.r_outer_in < self.r_outer_out < self.r_b):
+            raise ValueError("coaxial radii must satisfy r_inner_in < r_inner_out < "
+                             "r_outer_in < r_outer_out < r_b")
         self.density = float(density_fluid)              # kg/m3
         self.heat_cap = float(heat_capacity_fluid)       # J/kgK
         self.mu_f = float(mu_fluid)                      # Pa s
@@ -373,7 +495,9 @@ class BTES_obj:
         self._C_per_m3 = self.density * self.heat_cap / 3.6e6   # kWh/(m3 K)
 
         # --- Operation --------------------------------------------------------------
-        self.max_V = float(max_V)                        # m3/h
+        self.max_V_per_borehole = float(max_V_per_borehole)          # m3/h per borehole
+        self.max_V = float(self.max_V_per_borehole * self.N_b if max_V is None
+                           else max_V)                               # m3/h field rating
         self.min_dT_extract = float(min_dT_extract)      # K
         self.min_useful_kW = float(min_useful_kW)        # kW
         self.pump_head = float(pump_head)                # m
@@ -431,18 +555,18 @@ class BTES_obj:
     # ------------------------------------------------------------------ #
     def _gfunc_spec(self):
         """Everything the g-function depends on. Hashed into the cache file name."""
-        return {"layout": "rectangle", "N_x": self.N_x, "N_y": self.N_y,
-                "B": self.B, "H": self.H, "D": self.D, "r_b": self.r_b,
+        return {"coords": [[round(x, 6), round(y, 6)] for x, y in self.coords],
+                "H": self.H, "D": self.D, "r_b": self.r_b,
                 "alpha": float(f"{self.alpha:.10e}"),
                 "method": self.gfunc_method, "bc": self.gfunc_bc,
                 "nSegments": self.gfunc_nSegments,
                 "grid": [GFUNC_T_MIN, GFUNC_T_MAX_YR, GFUNC_N_TIMES],
-                "pygfunction": getattr(gt, "__version__", "?")}
+                "pygfunction": _pygfunction_version()}
 
     def _load_or_compute_gfunction(self):
         spec = self._gfunc_spec()
         key = hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
-        path = os.path.join(_GFUNC_CACHE_DIR, f"g_{self.N_x}x{self.N_y}_H{self.H:g}"
+        path = os.path.join(_GFUNC_CACHE_DIR, f"g_{self.layout}_N{self.N_b}_H{self.H:g}"
                                               f"_B{self.B:g}_{key}.npz")
         if self.use_cache and os.path.isfile(path):
             data = np.load(path)
@@ -463,9 +587,9 @@ class BTES_obj:
         return t, g
 
     def _compute_gfunction(self, t):
-        """pygfunction g-function of the rectangular field at times t [s]."""
-        field = gt.boreholes.rectangle_field(self.N_x, self.N_y, self.B, self.B,
-                                             self.H, self.D, self.r_b)
+        """pygfunction g-function of the field (self.coords) at times t [s]."""
+        field = [gt.boreholes.Borehole(self.H, self.D, self.r_b, x, y)
+                 for x, y in self.coords]
         gfunc = gt.gfunction.gFunction(
             field, self.alpha, time=t, method=self.gfunc_method,
             boundary_condition=self.gfunc_bc,
@@ -497,8 +621,38 @@ class BTES_obj:
                                       self.k_s, self.k_g, R_p, nPipes=2,
                                       config="parallel")
 
+    def _coaxial_at_flow(self, borehole, m_b):
+        """
+        pygfunction Coaxial pipe at a flow of m_b [kg/s] (same construction as
+        pygfunction's coaxial example). Inlet = inner pipe, outlet = annulus.
+          R_ff : inner-pipe fluid -> annulus fluid (the in/out short circuit):
+                 inner-pipe convection + inner-pipe wall + annulus convection (inner side)
+          R_fp : annulus fluid -> outer pipe wall in contact with the grout:
+                 annulus convection (outer side) + outer-pipe wall
+        """
+        R_p_inner = gt.pipes.conduction_thermal_resistance_circular_pipe(
+            self.r_inner_in, self.r_inner_out, self.k_inner)
+        R_p_outer = gt.pipes.conduction_thermal_resistance_circular_pipe(
+            self.r_outer_in, self.r_outer_out, self.k_outer)
+        h_inner = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+            m_b, self.r_inner_in, self.mu_f, self.density, self.k_f,
+            self.heat_cap, self.epsilon)
+        h_a_in, h_a_out = gt.pipes.convective_heat_transfer_coefficient_concentric_annulus(
+            m_b, self.r_inner_out, self.r_outer_in, self.mu_f, self.density,
+            self.k_f, self.heat_cap, self.epsilon)
+        R_ff = (1.0 / (h_inner * 2 * np.pi * self.r_inner_in) + R_p_inner
+                + 1.0 / (h_a_in * 2 * np.pi * self.r_inner_out))
+        R_fp = R_p_outer + 1.0 / (h_a_out * 2 * np.pi * self.r_outer_in)
+        r_in = np.array([self.r_inner_in, self.r_outer_in])     # first = inlet pipe
+        r_out = np.array([self.r_inner_out, self.r_outer_out])
+        return gt.pipes.Coaxial((0.0, 0.0), r_in, r_out, borehole,
+                                self.k_s, self.k_g, R_ff, R_fp)
+
     def _pipe_at_flow(self, m_b):
         """Pipe object at a flow of m_b [kg/s] per borehole (sets convection)."""
+        if self.pipe_type == "coaxial":
+            borehole = gt.boreholes.Borehole(self.H, self.D, self.r_b, 0.0, 0.0)
+            return self._coaxial_at_flow(borehole, m_b)
         n_u = 1 if self.pipe_type == "single_U" else 2
         R_cond = gt.pipes.conduction_thermal_resistance_circular_pipe(
             self.r_in, self.r_out, self.k_p)
@@ -1016,7 +1170,9 @@ class BTES_obj:
     def summary(self):
         """Print the sizing and the mature-year balance."""
         print("-" * 72)
-        print(f"BTES '{self.name}': {self.N_x} x {self.N_y} = {self.N_b} boreholes, "
+        field = (f"{self.N_x} x {self.N_y} = {self.N_b}" if self.layout == "rectangle"
+                 else f"{self.N_b} ({self.layout})")
+        print(f"BTES '{self.name}': {field} boreholes, "
               f"H = {self.H:g} m, B = {self.B:g} m, D = {self.D:g} m, r_b = {self.r_b:g} m")
         print(f"  drilled {self.H_tot:,.0f} m, ground volume {self.V_ground:,.0f} m3 "
               f"({self.C_ground_kWh_per_K / 1e3:.1f} MWh/K), "
@@ -1027,7 +1183,13 @@ class BTES_obj:
               f"g(10 yr) = {float(self.g_of_t(3.1536e8)):.2f}")
         print(f"  {self.pipe_type}: design flow {self.m_design_per_borehole:.3f} kg/s per "
               f"borehole, R_b,eff = {self.R_b_design:.3f} mK/W, eps = {self.eps_design:.3f}")
-        print(f"  max_V = {self.max_V:g} m3/h, T_ground = {self.T_g:g} C, "
+        if self.pipe_type == "coaxial":
+            v_dot = self.m_design_per_borehole / self.density                # m3/s
+            a_in = np.pi * self.r_inner_in ** 2
+            a_ann = np.pi * (self.r_outer_in ** 2 - self.r_inner_out ** 2)
+            print(f"  flow velocity at design flow: inner pipe {v_dot / a_in:.2f} m/s, "
+                  f"annulus {v_dot / a_ann:.2f} m/s")
+        print(f"  max_V = {self.max_V:g} m3/h, T_ground = {self.T_g:.1f} C, "
               f"capex = {self.capex / 1e6:.2f} Meuro, fix_opex = {self.fix_opex / 1e3:.1f} keuro/yr")
         if hasattr(self, "heat_delivered_kWh"):
             print(f"  charge {self.T_charge:g} C, {self.volume:,.0f} m3/yr | "
@@ -1054,30 +1216,43 @@ if __name__ == "__main__":
     from matplotlib.ticker import MaxNLocator
 
     # ------------------------------------------------------------------ #
-    #  Standalone test, no main2 needed: default field, synthetic year     #
-    #  (same demand, charging volume and HP as the MTES_obj_Peter demo)    #
+    #  Standalone test, no main2 needed: default (Darmstadt) field and a   #
+    #  synthetic year. Same structure as the MTES_obj_Peter demo. Charging #
+    #  volume, winter deficit and HP all scale with the number of          #
+    #  boreholes, so changing N_BOREHOLES keeps the scenario consistent.   #
     # ------------------------------------------------------------------ #
+    # --- Demo scenario (per borehole, so it scales with the field) -----------
+    DEFICIT_PEAK_KW_PER_BOREHOLE = 400.0 / 3   # [kW]    winter deficit peak per borehole
+    HP_KW_EL_PER_BOREHOLE        = 100.0 / 3   # [kW_el] HP compressor rating per borehole
+    CHARGE_FILL_OF_MAX_V         = 0.9         # [-]     charging peak as share of max_V
+
     dt = 3600
     n = 8760
     hours = np.arange(n)
-    T_supply, T_return = 75.0, 55.0      # DHN, as in model_driver.py
-    T_charge = 75.0                       # geothermal outlet = charging temperature
+    T_supply, T_return = 70.0, 45.0      # DHN supply / return, Darmstadt demo
+    T_charge = 80.0                       # charging temperature (measured max 80-84 C) [DATA]
+    _N_b = N_BOREHOLES if LAYOUT == "triangular" else N_X * N_Y
 
     # Winter deficit the storage should cover [kWh per hour]: peak on Jan 1 / Dec 31.
+    # 3 boreholes: 0.4 MW peak, ~1.1 GWh/yr; 37 boreholes: ~4.9 MW peak, ~13.8 GWh/yr.
     winter = np.clip(np.cos(2 * np.pi * hours / n), 0.0, None)
-    missing_energy = pd.Series(1200.0 * winter)          # 1.2 MW peak, ~3.3 GWh/yr
+    missing_energy = pd.Series(DEFICIT_PEAK_KW_PER_BOREHOLE * _N_b * winter)
     storage_extraction = np.ones(n)
 
     # Charging volume for the summer: initialize() builds the half-cosine profile
     # itself when flow_injected is not set (main2 would supply the real one).
-    Volume = 300_000                                      # m3/yr, peak ~108 m3/h < max_V
+    # The profile peaks at Volume * pi / n per hour, so CHARGE_FILL_OF_MAX_V of
+    # the field rating gives the largest volume that is not clipped by max_V.
+    _field_max_V = MAX_V_PER_BOREHOLE * _N_b
+    Volume = round(CHARGE_FILL_OF_MAX_V * _field_max_V * n / np.pi, -3)  # m3/yr
 
     WITH_HP = True
     hp = None
     if WITH_HP:
         try:
             from main2_Peter import heat_pump_ATES
-            hp = heat_pump_ATES(power_el=250, delta_T_coldside=20)   # kW_el, K
+            hp = heat_pump_ATES(power_el=HP_KW_EL_PER_BOREHOLE * _N_b,
+                                delta_T_coldside=20)                 # kW_el, K
         except Exception as e:                        # main2 pulls in the ATES stack
             print(f"Heat pump demo skipped ({e!r}); running without HP.")
 
@@ -1088,7 +1263,9 @@ if __name__ == "__main__":
             continue
         print("\n" + "#" * 72)
         print(f"#  RUN {k}/{len(cases)}: {label.upper()}   "
-              f"({N_X} x {N_Y} boreholes, H = {H_BOREHOLE:g} m, max_V = {MAX_V:g} m3/h, "
+              f"({_N_b} boreholes, deficit peak "
+              f"{DEFICIT_PEAK_KW_PER_BOREHOLE * _N_b / 1e3:.1f} MW, "
+              f"H = {H_BOREHOLE:g} m, max_V = {_field_max_V:g} m3/h, "
               f"N_YEARS = {N_YEARS}"
               + (f", HP = {HP.power_el:g} kW_el, dT_cold = {HP.delta_T_coldside:g} K)"
                  if HP is not None else ")"))
@@ -1192,7 +1369,8 @@ if __name__ == "__main__":
         # First year within 0.5 % of the final value -> "spun up" from here on.
         # Labels staggered so two runs converging in the same year stay readable.
         settled = np.where(np.abs(m.yearly_Reff - m.yearly_Reff[-1]) < 0.005)[0]
-        if len(settled) and len(yrs) > 1:
+        # Skipped when Reff stays ~0: a flat zero line has not "converged" anywhere.
+        if len(settled) and len(yrs) > 1 and m.yearly_Reff[-1] > 0.01:
             b1.axvline(yrs[settled[0]], color=c, lw=0.8, ls="--", alpha=0.5)
             b1.annotate(f"converged year {yrs[settled[0]]} ({label})",
                         (yrs[settled[0]], 0.08 + 0.09 * list(runs).index(label)),
@@ -1233,7 +1411,7 @@ if __name__ == "__main__":
     fig, ax = plt.subplots(figsize=(9, 5))
     ln_ts = np.log(_m0.g_time / _m0.t_s)
     ax.plot(ln_ts, _m0.g_values, "o-", ms=3, lw=1.5, color="tab:blue",
-            label=f"{_m0.N_x} x {_m0.N_y} field, B/H = {_m0.B / _m0.H:.3f}")
+            label=f"{_m0.N_b} boreholes ({_m0.layout}), B/H = {_m0.B / _m0.H:.4f}")
     for t_mark, lbl in [(86400, "1 day"), (30 * 86400, "1 month"),
                         (3.1536e7, "1 year"), (3.1536e8, "10 years")]:
         x = np.log(t_mark / _m0.t_s)

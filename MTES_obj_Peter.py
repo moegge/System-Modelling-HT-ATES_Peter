@@ -45,21 +45,26 @@ has no such curve: its temperature is a STATE. Therefore
       time-steps ONE FULL YEAR chronologically -- charging with
       self.flow_injected (set by main2 just before initialize()) at T_charge,
       discharging wherever missing_energy > 0 -- and repeats that identical year
-      n_spinup_years times (default 1: a single year starting from the undisturbed
-      mine at T_ground; 8 lets the rock warm up to its periodic steady state).
+      n_spinup_years times (default: the N_YEARS toggle at the top of this file;
+      1 = a single year from the undisturbed mine at T_ground, 8 = ATES-like,
+      rock in periodic steady state).
       The per-timestep arrays report the LAST year; the per-year
       totals fill total_heat_extracted_vs_T_ground_kWh_first_8_years, the
       8-year ramp main2's LCOE uses (for the ATES that array holds the 8 MODFLOW
       years).
 
 Discharge in a timestep (same split as ATES_obj._energy_split, with the tank
-temperature in place of the well curve):
-  Q_dir  = C * max(0, T_tank - T_return)                        direct HX to the DHN
-  Q_evap = min( C * max(0, min(T_tank, T_return) - T_floor),     HP source heat,
+temperature in place of the well curve). f = RECOVERY_FACTOR scales what ARRIVES,
+applied after the ideal HX and BEFORE the heat pump:
+  Q_dir  = f * C * max(0, T_tank - T_return)                    direct HX to the DHN
+  Q_evap = min( f * C * max(0, min(T_tank, T_return) - T_floor), HP source heat,
                 P_el,max * (COP - 1) * dt )                      capped by the compressor
   P_el   = Q_evap / (COP - 1);   delivered = Q_dir + Q_evap + P_el
-The extracted water goes BACK INTO THE TANK at T_tank - (Q_dir + Q_evap)/C: an
-MTES has no cold well, and that return is what cools the mine down.
+  Q_water = (Q_dir + Q_evap) / f                                out of the mine water
+The extracted water goes BACK INTO THE TANK at T_tank - Q_water/C: an MTES has no
+cold well, and that return is what cools the mine down. Note Q_water, not the
+delivered heat -- the (1 - f) recovery loss still cools the mine, which is what
+keeps Reff at ~f instead of drifting back to 1.
 Modes: 'A' HX only, 'B' HX + HP (T_tank >= T_return), 'D' HP only (T_tank < T_return).
 
 INTERFACE CONTRACT (what main2_Peter reads / calls on the storage object)
@@ -99,6 +104,61 @@ from ATES_obj_Peter import cold_well_T
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
+# ================================================================== #
+#  TOGGLE: number of identical years simulated back-to-back, and     #
+#  therefore which year the results describe.                        #
+#    1 -> one year from the undisturbed mine at T_ground: the fill-up #
+#         year, most of the charge goes into warming water and rock. #
+#    8 -> ATES-like: the 8th year of a repeating annual cycle, rock  #
+#         in periodic steady state (ATES_obj reports year 8 of its   #
+#         MODFLOW data; main2's LCOE ramp array also has 8 entries). #
+#  A run can still override this with MTES_obj(..., n_spinup_years=).#
+# ================================================================== #
+N_YEARS = 10
+
+# ================================================================== #
+#  TOGGLE: recovery factor [-], 0 < f <= 1.                          #
+#  A FLAT derating of the storage: the mine water still gives up the  #
+#  full heat (so it cools at the same rate and the energy balance     #
+#  closes), but only this share ARRIVES -- at the DHN through the HX, #
+#  and at the HP evaporator. The rest is booked as a recovery loss.   #
+#  Applied AFTER the ideal HX and BEFORE the heat pump, so the HP     #
+#  sees the derated source heat and its COP/electricity follow.       #
+#                                                                    #
+#  DEFAULT IS NOW 1.0 (no flat derating), because the far-field loss  #
+#  below is the physical mechanism and is temperature-dependent: the  #
+#  HP case runs the mine colder, so it loses less, automatically.     #
+#  A flat factor cannot do that -- it takes the same share whether    #
+#  the mine is at 74 C or 55.2 C, which is exactly the HP/no-HP       #
+#  distinction we want to keep. Use f < 1 only for losses that are    #
+#  NOT conduction to the ground (HX effects, short-circuiting).       #
+#  A run can override with MTES_obj(..., recovery_factor=).           #
+# ================================================================== #
+RECOVERY_FACTOR = 1.0
+
+# ================================================================== #
+#  TOGGLE: mine depth [m] below the ground surface.                  #
+#  Only used to DERIVE the far-field heat loss when loss_W_per_K is  #
+#  left at None (the default), from the standard conduction shape    #
+#  factor for a horizontal cylinder buried below an isothermal        #
+#  surface held at T_ground (Incropera, S = 2 pi L / arccosh(2z/D)):  #
+#                                                                    #
+#      G = 2 pi L lambda_rock / arccosh(z / r_th_max)     [W/K]       #
+#                                                                    #
+#  This replaces the flat RECOVERY_FACTOR as the loss mechanism. It   #
+#  is TEMPERATURE-DEPENDENT (Q = G * (T_rock - T_ground)), so a mine  #
+#  run colder -- e.g. the HP case, which pulls it to the 35 C floor   #
+#  instead of 55 C -- loses proportionally less, which is the whole   #
+#  point. Reff then comes out of the physics rather than a knob.      #
+#  CAVEAT: this is the STEADY-STATE loss. The real loss is higher in  #
+#  the first decades while the far field is still warming, so this is #
+#  a lower bound. The rigorous alternative is a time-dependent ground #
+#  response (g-function + load aggregation, as BTES_obj uses), which  #
+#  would also remove the t_max_days assumption behind r_th_max.       #
+#  Valid for z > 1.5 * r_th_max; warns and clips otherwise.           #
+# ================================================================== #
+MINE_DEPTH_M = 100.0
+
 # ATES_obj keywords that have no meaning for a mine. Accepted and ignored (with a
 # warning) so a driver can swap ATES_obj -> MTES_obj without touching every call.
 _AQUIFER_ONLY_KWARGS = {"thickness", "porosity", "kh", "ani", "N_wells",
@@ -136,17 +196,51 @@ class MTES_obj:
         mine per hour (default 150, pump 3 in the thesis). Also the sizing base
         for capex / fix_opex, exactly as in ATES_obj.
     min_dT_extract : float, optional
-        The discharge pump is not started unless the mine water is at least this
-        much [K] above the temperature it would be returned at (default 0.5).
-        Stops the pump running at full flow for a few kWh once the mine has
-        cooled to the return / HP floor. [ASSUMED]
-    depth : float, optional
-        Pumping lift [m] for the opex electricity (default 100). [ASSUMED]
-    loss_W_per_K : float, optional
-        Optional conductance from the rock node to the undisturbed far field at
-        T_ground [W/K]. 0 (default) reproduces mtes_class.MTES exactly. NOTE that
-        the model is then lossless in the long run -- the rock only buffers --
-        so the recovery efficiency tends to 1 after spin-up. [ASSUMED]
+        Minimum useful temperature difference [K] between the mine water and the
+        temperature it is returned at, below which the discharge pump does not
+        start. Default 0.0 = IDEAL heat exchanger with no approach temperature:
+        the mine is usable right down to the DHN return (or the HP floor), the
+        same assumption ATES_obj makes. Raise it to represent a real HX approach
+        temperature (e.g. 3 K -> the mine stops at 58 C against a 55 C return),
+        which also acts as a deadband on the pump. [ASSUMED]
+    min_heat_per_elec : float, optional
+        Minimum useful heat per unit of pumping electricity [kWh_th / kWh_el],
+        i.e. a COP for the circulation pump (default 5). The discharge pump does
+        not start unless a FULL-flow pass would clear it, so the mine stops when
+        circulating the water costs more than the heat is worth. Because both
+        sides scale with flow this is a temperature deadband DERIVED from the
+        pumping economics instead of guessed, and it follows pump_head_m,
+        pump_efficiency, recovery_factor and the DHN levels automatically.
+        Break-even is 1.0; below that the pump burns more electricity than it
+        delivers heat. Set 0 to disable. Separates pump CONTROL from the HX
+        physics in min_dT_extract. [ASSUMED]
+    recovery_factor : float, optional
+        Share of the extracted heat that actually arrives, 0 < f <= 1. None
+        (default) -> the RECOVERY_FACTOR toggle at the top of this file. See the
+        comment there: the water gives up the full heat, only f reaches the DHN /
+        HP evaporator, and Reff settles at ~f instead of 1. [ASSUMED]
+    pump_head_m : float, optional
+        FRICTION head of the circulation loop [m] (default 20 m ~ 2 bar), used for
+        the pumping electricity in calc_opex and for the min_heat_per_elec test.
+        NOT the mine depth: in a closed doublet the water rises in one borehole and
+        falls in the other, so the static head cancels and the pump only fights
+        pipe / borehole / HX pressure drop. Replace with the real loop pressure
+        drop if it is known -- it scales the pumping OPEX linearly and sets the
+        temperature at which discharge stops. [ASSUMED]
+    loss_W_per_K : float or None, optional
+        Conductance from the rock node to the undisturbed far field at T_ground
+        [W/K]. None (default) DERIVES it from the buried-cylinder conduction shape
+        factor, G = 2 pi L lambda / arccosh(mine_depth_m / r_th_max) -- see the
+        MINE_DEPTH_M block at the top. Because the loss is then proportional to
+        (T_rock - T_ground), a mine run colder (the HP case) loses less, and Reff
+        falls out of the physics instead of the flat RECOVERY_FACTOR. Pass a number
+        to override; pass 0.0 to restore mtes_class.MTES exactly, which is lossless
+        in the long run -- the rock only buffers -- so Reff tends to 1 after
+        spin-up. Whether it was derived is recorded in loss_is_derived. [ASSUMED]
+    mine_depth_m : float, optional
+        Depth of the mine below the ground surface [m]. None (default) -> the
+        MINE_DEPTH_M toggle at the top. ONLY used to derive loss_W_per_K; it is
+        not the pumping head (see pump_head_m). [ASSUMED]
     costperm3 : float, optional
         CAPEX per m3/h of pump capacity [euro/(m3/h)] (default 3400000/320, the
         ATES value; the example files contain no MTES cost data). [ATES-PARITY]
@@ -167,9 +261,10 @@ class MTES_obj:
     HP : heat_pump_ATES or None, optional
         Discharge-side heat pump, the same object as for the ATES.
     n_spinup_years : int, optional
-        Identical years simulated back-to-back (default 1: one year from the
-        undisturbed mine at T_ground). 8 = length of main2's LCOE ramp array and
-        enough for the rock to reach its periodic steady state.
+        Identical years simulated back-to-back. None (default) -> the N_YEARS
+        toggle at the top of this file. 1 = one year from the undisturbed mine at
+        T_ground; 8 = ATES-like (length of main2's LCOE ramp array, rock in
+        periodic steady state).
     name : str, optional
         Column prefix in main2's result DataFrame (default "MTES").
     timing, verbose : bool, optional
@@ -181,17 +276,23 @@ class MTES_obj:
         Tank / rock temperature per timestep, last (steady-state) year [C].
     T_tank_hist_all, T_rock_hist_all : np.ndarray
         Same over the whole spin-up (n_spinup_years * n + 1 points).
-    yearly_delivered_kWh, yearly_extracted_kWh, yearly_charged_kWh,
-    yearly_offered_kWh, yearly_loss_kWh : np.ndarray
+    yearly_delivered_kWh, yearly_extracted_kWh, yearly_useful_kWh,
+    yearly_charged_kWh, yearly_offered_kWh, yearly_loss_kWh,
+    yearly_rec_loss_kWh : np.ndarray
         Per spin-up year: heat to the DHN (incl. HP electricity), heat taken out
-        of the tank (Q_dir + Q_evap), heat the tank actually absorbed, heat the
-        supply side sent (main2's accounting: flow * (T_charge - T_floor)), and
-        far-field loss.
+        of the mine WATER (raw, what cools the mine), the part of that which
+        arrived (= raw * recovery_factor), heat the tank actually absorbed, heat
+        the supply side sent (main2's accounting: flow * (T_charge - T_floor)),
+        far-field loss, and the recovery loss (raw - useful).
+    yearly_Reff : np.ndarray
+        Recovery efficiency of each spin-up year, useful / absorbed. Rises from
+        well below its final value (year 1 fills cold water AND cold rock) to
+        ~recovery_factor once the year is periodic. yearly_Reff[-1] is Reff.
     Reff : float
-        Recovery efficiency of the mature year, extracted / absorbed: the share
-        of the heat that went into the mine that came back out (1.0 with the
-        default lossless rock buffer; < 1 with loss_W_per_K > 0). Comparable to
-        the ATES well recovery efficiency.
+        Recovery efficiency of the mature year, useful / absorbed: the share of
+        the heat that went into the mine that came back out AND arrived. Settles
+        at ~recovery_factor (further reduced by loss_W_per_K if that is set).
+        Comparable to the ATES well recovery efficiency.
     utilisation : float
         absorbed / offered: the share of the surplus main2 booked to the storage
         that the mine could actually take. Drops well below 1 when the mine is
@@ -207,14 +308,15 @@ class MTES_obj:
                  # --- water [THESIS Table 4.2] -------------------------------------
                  density_fluid=997.0, heat_capacity_fluid=4180.0,
                  # --- site ---------------------------------------------------------
-                 T_ground=10.0, max_V=150.0, min_dT_extract=0.5, depth=100.0,
-                 loss_W_per_K=0.0,
+                 T_ground=10.0, max_V=150.0, min_dT_extract=0.0, min_heat_per_elec=5.0,
+                 pump_head_m=20.0, loss_W_per_K=None, mine_depth_m=None,
+                 recovery_factor=None,
                  # --- economics ----------------------------------------------------
-                 costperm3=3400000 / 320, capex_fixed=0.0, cost_per_m3_tank=0.0,
+                 costperm3=651672/150, capex_fixed=0.0, cost_per_m3_tank=0.0,
                  fixed_opex=765.6, var_opex=2 / 40, lifetime=25,
                  elec_price=0.2, pump_efficiency=0.5,
                  # --- coupling / run control ---------------------------------------
-                 HP=None, n_spinup_years=1, name="MTES",
+                 HP=None, n_spinup_years=None, name="MTES",
                  timing=False, verbose=False,
                  **aquifer_kwargs):
         # Identity for main2_Peter.system()
@@ -247,7 +349,26 @@ class MTES_obj:
         self.ln_ratio = np.log(self.r_th_max / self.r_tank)
         # Conductance tank <-> rock (eq. 4.32 without dT and dt)
         self.G_cond = 2 * np.pi * self.L * lambda_rock / self.ln_ratio   # W/K
-        self.loss_W_per_K = float(loss_W_per_K)
+        # --- Far-field loss: rock buffer -> undisturbed ground -------------------
+        # None -> derive from the buried-cylinder conduction shape factor (see the
+        # MINE_DEPTH_M block at the top). A number overrides it; 0.0 restores
+        # Till's original lossless model, where the rock only buffers.
+        self.mine_depth_m = float(MINE_DEPTH_M if mine_depth_m is None else mine_depth_m)
+        if loss_W_per_K is None:
+            z_over_r = self.mine_depth_m / self.r_th_max
+            if z_over_r <= 1.5:
+                warnings.warn(
+                    f"MTES_obj: mine_depth_m / r_th_max = {z_over_r:.2f} is outside the "
+                    f"shape-factor's validity range (z > 1.5 r); clipped to 1.5. Give an "
+                    f"explicit loss_W_per_K, or a larger mine_depth_m.",
+                    RuntimeWarning, stacklevel=2)
+                z_over_r = 1.5
+            self.loss_W_per_K = (2 * np.pi * self.L * self.lambda_rock
+                                 / np.arccosh(z_over_r))
+            self.loss_is_derived = True
+        else:
+            self.loss_W_per_K = float(loss_W_per_K)
+            self.loss_is_derived = False
 
         # --- Water --------------------------------------------------------------
         self.density = density_fluid         # kg/m3
@@ -260,12 +381,36 @@ class MTES_obj:
         self.T_g = float(T_ground)           # C, undisturbed mine temperature
         self.max_V = float(max_V)            # m3/h pump rating
         self.min_dT_extract = float(min_dT_extract)   # K
-        self.depth = depth                   # m pumping lift
+        self.min_heat_per_elec = float(min_heat_per_elec)   # [-] kWh_th per kWh_el
+        self.recovery_factor = float(RECOVERY_FACTOR if recovery_factor is None
+                                     else recovery_factor)
+        if not 0.0 < self.recovery_factor <= 1.0:
+            raise ValueError(f"recovery_factor must be in (0, 1], got "
+                             f"{self.recovery_factor}")
+        self.pump_head_m = float(pump_head_m)   # m, FRICTION head of the loop
         self.pump_efficiency = pump_efficiency
-        # Pump electricity per m3 moved: rho g h / eta  ->  kWh/m3
-        self.pump_kWh_per_m3 = density_fluid * 9.81 * depth / pump_efficiency / 3.6e6
+        # Pump electricity per m3 circulated: rho g h_fric / eta -> kWh/m3.
+        # h_fric is the loop FRICTION head, NOT the mine depth: in a closed doublet
+        # the water rises in one borehole and falls in the other, so the static head
+        # cancels and the pump only fights pipe / borehole / HX pressure drop.
+        # (ATES_obj charges rho g dh from the Thiem equation instead, which IS a real
+        # dissipative loss -- pushing water through porous rock. Not applicable here.)
+        self.pump_kWh_per_m3 = (density_fluid * 9.81 * self.pump_head_m
+                                / pump_efficiency / 3.6e6)
 
         # --- Economics (same structure as ATES_obj so the LCOE maths is shared) --
+        #P: CHECK THE CAPEX/OPEX AGAIN. All cost numbers here are carried over from
+        #P: ATES_obj or assumed; none come from an MTES source. Open points:
+        #P:  - capex scales with max_V (pump rating) only; cost_per_m3_tank and
+        #P:    capex_fixed default to 0, so mine volume and shaft/access costs are
+        #P:    currently free. Is max_V the right cost driver for a mine?
+        #P:  - fixed_opex is still David's 765.6 euro/(m3/h)/yr, which against the
+        #P:    current costperm3 is ~18 %/yr of capex (it was ~7 % for the ATES).
+        #P:    Either rescale it with the same source or put it on a % basis.
+        #P:  - var_opex = 2/40 is inherited and NEVER USED (calc_opex ignores it,
+        #P:    main2 only reads var_opex on the suppliers). Delete or wire it up.
+        #P:  - lifetime 25 yr is the ATES value; a mine reuse project is likely longer.
+        #P:  - pump_head_m = 20 m friction is a guess -> scales pumping opex linearly.
         self.capex = capex_fixed + costperm3 * self.max_V + cost_per_m3_tank * self.V_tank
         self.fix_opex = fixed_opex * self.max_V   # euro/yr
         self.var_opex = var_opex                  # euro/kWh
@@ -281,7 +426,7 @@ class MTES_obj:
             print("MTES connected Heat pump is not recognised, set to no Heat pump")
             self.HP = None
 
-        self.n_spinup_years = int(n_spinup_years)
+        self.n_spinup_years = int(N_YEARS if n_spinup_years is None else n_spinup_years)
         self.timing = timing
         self.verbose = verbose
 
@@ -408,26 +553,37 @@ class MTES_obj:
         (identical to ATES_obj._energy_split, with the mixed tank temperature in
         place of the well curve's mean extraction temperature).
 
+        The recovery factor f scales what ARRIVES: the mine water gives up the
+        full heat (so it cools at the same rate and the energy balance closes),
+        but only f of it reaches the DHN through the HX and the HP evaporator.
+        The (1 - f) remainder is a recovery loss.
+
         flow_m3  : volume pumped out of the mine this timestep [m3]
         T_tank   : mine water temperature at the start of the step [C]
         T_inj    : target temperature of the water going back [C]
                    (= self.T_return if HP off, = self.T_floor if HP on)
-        Returns (Q_dir, Q_evap, P_el, Q_tot, COP) in kWh.
+        Returns (Q_dir, Q_evap, P_el, Q_tot, COP, Q_water) in kWh. The first four
+        are USEFUL heat (post-factor); Q_water is what actually left the mine
+        water (= (Q_dir + Q_evap) / f) and is what sets T_back.
         """
+        f = self.recovery_factor
         C_A = flow_m3 * self.density * self.heat_cap / 3.6e6   # kWh/K
 
-        # (a) Direct HX: only the part of the mine water ABOVE the DHN return
-        Q_dir = C_A * max(0.0, T_tank - self.T_return)
+        # (a) Direct HX: only the part of the mine water ABOVE the DHN return.
+        Q_dir_water = C_A * max(0.0, T_tank - self.T_return)   # out of the water
+        Q_dir = f * Q_dir_water                                # into the DHN
 
         if not hp_running or self.HP is None:
-            return Q_dir, 0.0, 0.0, Q_dir, np.nan
+            return Q_dir, 0.0, 0.0, Q_dir, np.nan, Q_dir_water
 
         # (b) Source heat available if this step's water is cooled to T_inj.
         #     Mode B: glide T_return -> T_floor.   Mode D: glide T_tank -> T_floor.
+        #     f is applied HERE, before the HP, so the compressor sees the
+        #     derated source heat and its COP / electricity follow from it.
         T_evap_in = min(T_tank, self.T_return)
-        Q_evap_avail = C_A * max(0.0, T_evap_in - T_inj)
+        Q_evap_avail = f * C_A * max(0.0, T_evap_in - T_inj)
         if Q_evap_avail <= 0.0:
-            return Q_dir, 0.0, 0.0, Q_dir, np.nan
+            return Q_dir, 0.0, 0.0, Q_dir, np.nan, Q_dir_water
 
         # (c) COP from the actual temperatures this step (varies in mode D).
         T_source = 0.5 * (T_evap_in + T_inj)
@@ -438,7 +594,9 @@ class MTES_obj:
         Q_evap = min(Q_evap_avail, Q_evap_cap)
         P_el = Q_evap / (COP - 1.0)
 
-        return Q_dir, Q_evap, P_el, Q_dir + Q_evap + P_el, COP
+        # Heat that left the water: the evaporator only received f of its share.
+        Q_water = Q_dir_water + Q_evap / f
+        return Q_dir, Q_evap, P_el, Q_dir + Q_evap + P_el, COP, Q_water
 
     def calc_heat(self, T_cutoff, T_demand_out, storage_extraction, missing_energy,
                   hp_on=None, hp_override_below_cutoff=True,
@@ -491,6 +649,15 @@ class MTES_obj:
         max_flow_step = min(self.max_V * dt / 3600.0, self.V_tank)     # m3 per step
         C_per_m3 = self.density * self.heat_cap / 3.6e6                # kWh/(m3 K)
 
+        # NOTE: no "extracted <= injected" cap here, unlike ATES_obj. The aquifer's
+        # injected volume IS its stored heat -- a hot bubble of finite extent, so
+        # extracting past it would draw ambient groundwater at T_ground. The mine is
+        # a CLOSED DOUBLET: a fixed inventory of V_tank m3 circulates from one
+        # borehole through the surface HX/HP and back into the other. flow_injected
+        # and flow_extracted are THROUGHPUT, not stock, and nothing runs out.
+        # The only limits are the pump rating (max_flow_step) and the temperature
+        # floor (min_dT_extract above T_return without HP, above T_floor with one).
+
         # --- Temperature levels (set once, never mutated) -----------------------
         self.T_return = float(T_cutoff)                                # HX floor
         self.T_floor = cold_well_T(T_cutoff, self.T_g, self.HP)        # HP cold side
@@ -526,6 +693,7 @@ class MTES_obj:
         self.yearly_charged_kWh   = np.zeros(n_years)
         self.yearly_offered_kWh   = np.zeros(n_years)
         self.yearly_loss_kWh      = np.zeros(n_years)
+        self.yearly_rec_loss_kWh  = np.zeros(n_years)   # (1-f) share, never arrives
         self.yearly_T_tank_start  = np.zeros(n_years)
         self.yearly_T_rock_start  = np.zeros(n_years)
 
@@ -544,8 +712,7 @@ class MTES_obj:
             last = (year == n_years - 1)
             self.yearly_T_tank_start[year] = self.T_tank
             self.yearly_T_rock_start[year] = self.T_rock
-            Q_deliv = Q_extr = Q_ch = Q_off = Q_loss = 0.0
-            V_extr = 0.0            # ATES-PARITY: annual extracted <= annual injected
+            Q_deliv = Q_extr = Q_ch = Q_off = Q_loss = Q_rec_loss = 0.0
 
             for t in range(n):
                 # ---- 1. Charging: supply water at T_charge into the mine ---------
@@ -573,15 +740,28 @@ class MTES_obj:
                         hp_running = True
                     T_inj = self.T_floor if hp_running else self.T_return
 
-                    # Mine (almost) at the return level: nothing worth pumping for.
-                    # Or the year's injected volume has all been extracted (ATES-PARITY,
-                    # same cap as ATES_obj.calc_heat's max_flow).
-                    flow = min(max_flow_step, flow_inj.sum() - V_extr)
-                    if T_now - T_inj < self.min_dT_extract or flow <= 0.0:
+                    # Mine down to the return level (no HP) or to the HP floor:
+                    # nothing left to extract. With the default min_dT_extract = 0
+                    # the HX is ideal, so the mine is usable right down to T_inj.
+                    # This temperature limit -- together with the pump rating --
+                    # is the ONLY thing that stops discharge.
+                    flow = max_flow_step
+                    Q_water = 0.0
+                    if T_now - T_inj < self.min_dT_extract:
                         Q_tot = 0.0
                     else:
-                        Q_dir, Q_evap, P_el, Q_tot, COP = self._energy_split(
+                        Q_dir, Q_evap, P_el, Q_tot, COP, Q_water = self._energy_split(
                             flow, T_now, T_inj, T_demand_out, hp_running)
+                        # Pump control, as a "COP for the pump": run only if the heat
+                        # that arrives is worth the electricity to circulate it.
+                        # Both sides scale with flow, so this is a temperature
+                        # deadband DERIVED from the pumping economics rather than
+                        # guessed, and it re-derives itself when pump_head_m,
+                        # pump_efficiency, recovery_factor or the DHN levels change.
+                        # Tested on the capability (full flow), not on the demand-
+                        # matched flow below, so a small deficit is still served.
+                        if Q_tot < self.min_heat_per_elec * flow * self.pump_kWh_per_m3:
+                            Q_tot = 0.0
 
                     # Don't over-deliver: shrink the flow to match missing_energy.
                     # Q_dir and Q_evap_avail are linear in flow, the compressor cap
@@ -592,7 +772,7 @@ class MTES_obj:
                             if 0.995 <= factor <= 1.0:
                                 break
                             flow *= factor
-                            Q_dir, Q_evap, P_el, Q_tot, COP = self._energy_split(
+                            Q_dir, Q_evap, P_el, Q_tot, COP, Q_water = self._energy_split(
                                 flow, T_now, T_inj, T_demand_out, hp_running)
                             if Q_tot <= 0.0:
                                 break
@@ -601,18 +781,20 @@ class MTES_obj:
                     # to gain from extra flow, so pump only what the evaporator can
                     # cool to T_floor. (In mode B the full flow stays: it feeds the HX,
                     # and the part the evaporator cannot take returns at T_return.)
+                    # Uses the WATER-side heat, so the reduced flow still lands on T_inj.
                     if Q_tot > 0.0 and Q_dir <= 0.0 and Q_evap > 0.0:
-                        flow = min(flow, Q_evap / (C_per_m3 * (T_now - T_inj)))
+                        flow = min(flow, Q_water / (C_per_m3 * (T_now - T_inj)))
 
                     if Q_tot > 0.0:
                         # The pumped water goes back into the mine at the temperature
                         # it leaves the HX / evaporator: that is what cools the tank.
+                        # Q_water, not Q_tot: the recovery loss still cools the mine.
                         C_A = flow * C_per_m3
-                        T_back = T_now - (Q_dir + Q_evap) / C_A
+                        T_back = T_now - Q_water / C_A
                         self._mix(T_back, flow)
                         Q_deliv += Q_tot
-                        Q_extr += Q_dir + Q_evap
-                        V_extr += flow
+                        Q_extr += Q_water
+                        Q_rec_loss += Q_water - (Q_dir + Q_evap)
 
                         if last:
                             hp_active = (Q_evap > 0.0)
@@ -643,6 +825,7 @@ class MTES_obj:
             self.yearly_charged_kWh[year]   = Q_ch
             self.yearly_offered_kWh[year]   = Q_off
             self.yearly_loss_kWh[year]      = Q_loss
+            self.yearly_rec_loss_kWh[year]  = Q_rec_loss
             if self.verbose:
                 print(f"{year + 1:>4} {self.yearly_T_tank_start[year]:>11.2f} "
                       f"{self.yearly_T_rock_start[year]:>11.2f} {Q_off:>12,.0f} "
@@ -658,17 +841,33 @@ class MTES_obj:
             ramp = np.concatenate([y, np.full(8 - len(y), y[-1])])
         self.total_heat_extracted_vs_T_ground_kWh_first_8_years = ramp
 
-        # Mature-year efficiencies. Reff = what came back of what went in (the ATES
-        # meaning); utilisation = what went in of what main2 booked to the storage.
+        # Heat that actually ARRIVED at the DHN/HP from the mine, per year: the
+        # raw heat removed from the water minus the recovery loss.
+        self.yearly_useful_kWh = self.yearly_extracted_kWh - self.yearly_rec_loss_kWh
+
+        # Recovery efficiency of EVERY simulated year, so the spin-up can be
+        # inspected/plotted. Depressed further while the rock is still warming up
+        # (the mine absorbs more than it gives back); -> recovery_factor once the
+        # year is periodic.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self.yearly_Reff = np.where(self.yearly_charged_kWh > 0,
+                                        self.yearly_useful_kWh / self.yearly_charged_kWh,
+                                        np.nan)
+
+        # Mature-year efficiencies. Reff = what ARRIVED of what went in (the ATES
+        # meaning), so it settles at ~recovery_factor rather than 1; utilisation =
+        # what went in of what main2 booked to the storage.
         absorbed = self.yearly_charged_kWh[-1]
         offered = self.yearly_offered_kWh[-1]
         if not self.Reff_set:
-            self.Reff = float(self.yearly_extracted_kWh[-1] / absorbed) if absorbed > 0 else 0.0
+            self.Reff = float(self.yearly_useful_kWh[-1] / absorbed) if absorbed > 0 else 0.0
         self.utilisation = float(absorbed / offered) if offered > 0 else 0.0
 
         self.heat_offered_kWh   = float(self.yearly_offered_kWh[-1])
         self.heat_charged_kWh   = float(self.yearly_charged_kWh[-1])
         self.heat_extracted_kWh = float(self.yearly_extracted_kWh[-1])
+        self.heat_useful_kWh    = float(self.yearly_useful_kWh[-1])
+        self.heat_rec_loss_kWh  = float(self.yearly_rec_loss_kWh[-1])
         self.heat_delivered_kWh = float(self.yearly_delivered_kWh[-1])
 
         # Backward compatibility: old main2 reads storage_obj.HP.COP
@@ -697,6 +896,12 @@ class MTES_obj:
     # ------------------------------------------------------------------ #
     def calc_opex(self, kWh_generated):
         """Fixed OPEX + pump electricity for every m3 moved in and out of the mine."""
+        #P: CHECK THIS AGAIN. kWh_generated is accepted but ignored (no variable
+        #P: opex term), the electricity is priced flat at elec_price rather than on
+        #P: the spot series the HP uses, and pumping is rho*g*h_fric/eta on EVERY m3
+        #P: circulated in both directions -- no part-load, so the pump is charged at
+        #P: full rate whenever it runs. Also note main2 only calls this when the
+        #P: storage is NOT named "ATES"; the ATES branch uses its own fixed formula.
         try:
             pumped = 0.0
             if self.flow_injected is not None:
@@ -738,14 +943,28 @@ class MTES_obj:
               f"G_cond = {self.G_cond / 1e3:.1f} kW/K")
         print(f"  max_V = {self.max_V:g} m3/h, T_ground = {self.T_g:g} C, "
               f"capex = {self.capex / 1e6:.2f} Meuro, fix_opex = {self.fix_opex / 1e3:.1f} keuro/yr")
+        # Deadband the min_heat_per_elec test works out to, for transparency.
+        _c = self.density * self.heat_cap / 3.6e6 * self.recovery_factor  # kWh/(m3.K)
+        _dT = (self.min_heat_per_elec * self.pump_kWh_per_m3 / _c) if _c > 0 else np.nan
+        print(f"  far-field loss {self.loss_W_per_K / 1e3:.2f} kW/K "
+              f"({'derived: z = %g m, r_th_max = %.2f m' % (self.mine_depth_m, self.r_th_max)
+                 if self.loss_is_derived else 'given'}), "
+              f"recovery factor {self.recovery_factor:g}")
+        print(f"  pump head {self.pump_head_m:g} m friction "
+              f"({self.pump_kWh_per_m3:.4f} kWh_el/m3), min heat/elec "
+              f"{self.min_heat_per_elec:g} -> stops {_dT:.2f} K above the return/floor")
         if hasattr(self, "heat_delivered_kWh"):
             print(f"  charge {self.T_charge:g} C, {self.volume:,.0f} m3/yr | "
                   f"return {self.T_return:g} C, floor {self.T_floor:g} C")
             print(f"  mature year: offered {self.heat_offered_kWh / 1e3:,.0f} MWh, "
                   f"absorbed {self.heat_charged_kWh / 1e3:,.0f} MWh, "
-                  f"extracted {self.heat_extracted_kWh / 1e3:,.0f} MWh, "
+                  f"out of the water {self.heat_extracted_kWh / 1e3:,.0f} MWh, "
+                  f"useful {self.heat_useful_kWh / 1e3:,.0f} MWh, "
                   f"delivered {self.heat_delivered_kWh / 1e3:,.0f} MWh")
-            print(f"  Reff (extracted/absorbed) = {self.Reff:.3f}, "
+            print(f"  recovery factor {self.recovery_factor:.2f} -> "
+                  f"recovery loss {self.heat_rec_loss_kWh / 1e3:,.0f} MWh "
+                  f"({'HX + HP source side' if self.HP is not None else 'HX side'})")
+            print(f"  Reff (useful/absorbed) = {self.Reff:.3f}, "
                   f"utilisation (absorbed/offered) = {self.utilisation:.3f}, "
                   f"pumped {np.nansum(self.flow_injected) + np.nansum(self.flow_extracted):,.0f} m3")
             modes = pd.Series(self.mode).value_counts()
@@ -786,11 +1005,17 @@ if __name__ == "__main__":
             print(f"Heat pump demo skipped ({e!r}); running without HP.")
 
     runs = {}
-    for label, HP in [("no HP", None), ("with HP", hp)]:
+    cases = [("no HP", None), ("with HP", hp)]
+    for k, (label, HP) in enumerate(cases, start=1):
         if label == "with HP" and HP is None:
             continue
+        print("\n" + "#" * 70)
+        print(f"#  RUN {k}/{len(cases)}: {label.upper()}   "
+              f"(V_tank = 7000 m3, max_V = 150 m3/h, N_YEARS = {N_YEARS}"
+              + (f", HP = {HP.power_el:g} kW_el, dT_cold = {HP.delta_T_coldside:g} K)" if HP is not None else ")"))
+        print("#" * 70)
         mtes = MTES_obj([], V_tank=7000, max_V=150, T_ground=10, HP=HP,
-                        n_spinup_years=1, verbose=True, timing=True)
+                        verbose=True, timing=True)          # years: N_YEARS toggle at the top
         mtes.initialize(Volume, T_charge, dt)
         hp_on = np.ones(n, dtype=bool) if HP is not None else None   # HP allowed all year
         out = mtes.calc_heat(T_return, T_supply, storage_extraction, missing_energy,
@@ -803,19 +1028,39 @@ if __name__ == "__main__":
             print(f"  HP: {np.nansum(mtes.P_el) / 1e3:,.0f} MWh_el, mean COP {cop.mean():.2f}")
         runs[label] = (mtes, out)
 
-    # --- Figure 1: spin-up of tank and rock ---------------------------------
-    fig, ax = plt.subplots(figsize=(11, 4.5))
-    for label, (m, _) in runs.items():
+    # --- Figure 1: spin-up of tank and rock, one panel per run -----------------
+    # Styled like the MTES_Rock_Temperatures plot in MTES/execute_fmu_adaptable.py:
+    # blue water / orange rock at lw 1.8, grey dashed year separators, integer year
+    # ticks, large fonts, legend below the axes.
+    fig, axes = plt.subplots(len(runs), 1, figsize=(12, 5.2 * len(runs)), sharex=True)
+    axes = np.atleast_1d(axes)
+
+    for ax, (label, (m, _)) in zip(axes, runs.items()):
         yrs = np.arange(len(m.T_tank_hist_all)) / n
-        ax.plot(yrs, m.T_tank_hist_all, lw=1.2, label=f"Tank ({label})")
-        ax.plot(yrs, m.T_rock_hist_all, lw=1.2, ls="--", label=f"Rock ({label})")
-    ax.axhline(T_return, color="k", lw=0.6, ls=":", label="DHN return")
-    ax.set_xlabel("Time [years]")
-    ax.set_ylabel("Temperature [C]")
-    ax.set_title("MTES spin-up: mine water and rock buffer")
-    ax.grid(alpha=0.4)
-    ax.legend(fontsize=8, ncol=2)
+
+        ax.plot(yrs, m.T_tank_hist_all, label="Water Temperature [°C]",
+                color="tab:blue", linewidth=1.8)
+        ax.plot(yrs, m.T_rock_hist_all, label="Rock Temperature [°C]",
+                color="tab:orange", linewidth=1.8)
+
+        ax.set_title(f"MTES Water & Rock Temperature Over Time  ({label})", fontsize=18)
+        ax.set_ylabel("Temperature [°C]", fontsize=15)
+        ax.grid(True, alpha=0.5)
+
+        # Integer year ticks + grey year separators, as in the reference figure.
+        year_ticks = np.arange(1, int(round(yrs[-1])) + 1)
+        ax.set_xticks(year_ticks)
+        ax.set_xticklabels([str(y) for y in year_ticks], fontsize=12)
+        ax.set_xlim(0, yrs[-1])
+        for x in year_ticks:
+            ax.axvline(x, color="gray", linestyle="--", linewidth=1)
+
+    axes[-1].set_xlabel("Time [years]", fontsize=15)
+    # One legend for the whole window: both panels carry the same two series.
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.10 if len(runs) > 1 else 0.20)
+    fig.legend(*axes[0].get_legend_handles_labels(),
+               loc="lower center", ncol=2, fontsize=13)
 
     # --- Figure 2: mature year, per run ----------------------------------------
     for label, (m, out) in runs.items():
@@ -842,5 +1087,72 @@ if __name__ == "__main__":
         a2.grid(alpha=0.4)
         a2.legend(fontsize=8, loc="upper center")
         fig.tight_layout()
+
+    # --- Figure 3: recovery efficiency per simulated year ----------------------
+    # Top panel is the answer, bottom panel is the reason: while the rock is still
+    # warming up the mine absorbs far more than it gives back, so Reff < 1. The two
+    # curves close as the year becomes periodic, and Reff -> 1 (the model is
+    # lossless unless loss_W_per_K > 0).
+    from matplotlib.ticker import MaxNLocator
+
+    fig, (b1, b2) = plt.subplots(2, 1, figsize=(11, 6.8), sharex=True,
+                                 gridspec_kw={"height_ratios": [2.0, 1.3]})
+    colours = {"no HP": "tab:blue", "with HP": "tab:red"}
+    for label, (m, _) in runs.items():
+        yrs = np.arange(1, len(m.yearly_Reff) + 1)
+        c = colours.get(label)
+
+        b1.plot(yrs, m.yearly_Reff, "o-", ms=4.5, lw=1.5, color=c, label=label)
+        b1.annotate(f"{m.yearly_Reff[-1]:.3f}", (yrs[-1], m.yearly_Reff[-1]),
+                    textcoords="offset points", xytext=(7, -4),
+                    fontsize=9, fontweight="bold", color=c)
+
+        # First year within 0.5 % of the converged value -> "spun up" from here on.
+        # Labels staggered so two runs converging in the same year stay readable.
+        settled = np.where(np.abs(m.yearly_Reff - m.yearly_Reff[-1]) < 0.005)[0]
+        if len(settled) and len(yrs) > 1:
+            b1.axvline(yrs[settled[0]], color=c, lw=0.8, ls="--", alpha=0.5)
+            b1.annotate(f"converged year {yrs[settled[0]]} ({label})",
+                        (yrs[settled[0]], 0.08 + 0.09 * list(runs).index(label)),
+                        textcoords="offset points", xytext=(5, 0),
+                        fontsize=8, color=c, ha="left",
+                        bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
+
+        # Absorbed vs USEFUL (not the raw water-side heat, which equals absorbed
+        # once periodic): the gap between the two curves IS the recovery loss, so
+        # their ratio is the number plotted above.
+        b2.plot(yrs, m.yearly_charged_kWh / 1e3, "o--", ms=3, lw=1.0,
+                color=c, alpha=0.55, label=f"absorbed ({label})")
+        b2.plot(yrs, m.yearly_useful_kWh / 1e3, "o-", ms=3, lw=1.5,
+                color=c, label=f"useful ({label})")
+
+    _f = runs[list(runs)[0]][0].recovery_factor
+    b1.axhline(1.0, color="k", lw=0.8, ls=":", alpha=0.5,
+               label="lossless model limit")
+    if _f < 1.0:
+        b1.axhline(_f, color="k", lw=0.9, ls="--", alpha=0.7,
+                   label=f"RECOVERY_FACTOR = {_f:g}")
+    b1.set_ylabel("Recovery efficiency\nuseful / absorbed  [-]")
+    _m0 = runs[list(runs)[0]][0]
+    b1.set_title(f"MTES recovery efficiency per simulated year "
+                 f"(V_tank = {_m0.V_tank:,.0f} m3, "
+                 f"RECOVERY_FACTOR = {_f:g}, "
+                 f"far-field loss = {_m0.loss_W_per_K / 1e3:.2f} kW/K"
+                 + (f" derived at z = {_m0.mine_depth_m:g} m)" if _m0.loss_is_derived else ")"))
+    b1.set_ylim(0, 1.15)
+    b1.grid(alpha=0.35)
+    # "best" so the box dodges the curves, which now plateau anywhere from ~0.2
+    # (small lossy mine) to ~1.0 (loss_W_per_K = 0) depending on the settings.
+    b1.legend(fontsize=8.5, loc="best")
+
+    b2.set_xlabel("Simulated year")
+    b2.set_ylabel("Heat [MWh/yr]")
+    b2.xaxis.set_major_locator(MaxNLocator(integer=True))
+    # Right margin scales with the run length so the end-value label always fits.
+    _ny = max(len(m.yearly_Reff) for m, _ in runs.values())
+    b2.set_xlim(0.5, _ny + max(0.6, 0.06 * _ny))
+    b2.grid(alpha=0.35)
+    b2.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
 
     plt.show()
