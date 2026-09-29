@@ -23,6 +23,14 @@ whole HP dispatch + output lives inside that loop. Charge-side HP is not
 implemented. Passing hp_on = all True therefore runs the HP on every discharge
 hour.
 
+SITE selects the site preset and with it the storage technology
+(site_config_<SITE>.py, PARAMS dict):
+  * "Delft"     -> HT-ATES  (ATES_obj_Peter)   = the defaults below
+  * "Bochum"    -> MTES     (MTES_obj_Peter)
+  * "Darmstadt" -> BTES     (BTES_obj_Peter, needs pygfunction)
+In the config names the "A" means "storage" of the site's type.
+Precedence:  run_case(...) argument  >  site preset  >  object default.
+
 Run from the repo root (needs main2_Peter.py, ATES_obj_Peter.py, results_AXI_V2,
 Predict_REFF_boostedregression.pkl, and the Amsterdam demand parquet).
 
@@ -31,6 +39,7 @@ Predict_REFF_boostedregression.pkl, and the Amsterdam demand parquet).
 ==================================================================
 """
 import os
+import importlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -39,11 +48,18 @@ from main2_Peter import (geothermal, demand_class, gas_boiler, heat_pump_ATES,
                          system, economic_analysis, system_plot, CO2_emissions_calc,
                          LCOE_calc_Yang)
 from ATES_obj_Peter import ATES_obj
+from site_config_Delft import PARAMS as _DELFT
 
 # ================================================================== #
 #  DEFAULT CONFIGURATION  --  the single-run defaults.               #
 #  A sweep overrides any of these by passing them to run_case().     #
+#  Site values (demand, source, storage, HP, prices) are the Delft   #
+#  preset; they stay module constants because the Delft Case        #
+#  scripts import them. Other sites: site_config_<SITE>.py.         #
 # ================================================================== #
+
+# --- Site (selects the preset in site_config_<SITE>.py) ---------------------
+SITE = "Delft"           # "Delft" (ATES), "Bochum" (MTES), "Darmstadt" (BTES)
 
 # --- Master toggle: run WITH or WITHOUT the discharge-side heat pump -------
 USE_HP = True            # True  -> HP created and attached to the ATES
@@ -57,30 +73,30 @@ CONFIG = None            # None -> derive from USE_HP; else one of
 TIMESTEP = 3600          # [s]
 
 # --- District-heating demand ----------------------------------------------
-DEMAND_EXAMPLE = "Amsterdam" #Amsterdam; Delft Peter; TU Delft
-DEMAND_T_IN    = 75      # [C] DHN supply temperature (HP condenser sink)
-DEMAND_T_OUT   = 55      # [C] DHN return temperature (= ATES cutoff / HX floor)
+DEMAND_EXAMPLE = _DELFT["DEMAND_EXAMPLE"]  # Amsterdam; Delft Peter; TU Delft
+DEMAND_T_IN    = _DELFT["DEMAND_T_IN"]     # [C] DHN supply temperature (HP condenser sink)
+DEMAND_T_OUT   = _DELFT["DEMAND_T_OUT"]    # [C] DHN return temperature (= storage cutoff / HX floor)
 
-# --- Geothermal baseload (also the ATES charging source) ------------------
-GEO_POWER = 5000         # [kW]
-GEO_T_OUT = 75           # [C]
+# --- Geothermal baseload (also the storage charging source) ---------------
+GEO_POWER = _DELFT["GEO_POWER"]            # [kW]
+GEO_T_OUT = _DELFT["GEO_T_OUT"]            # [C]
 
-# --- ATES aquifer ----------------------------------------------------------
-ATES_MAX_V     = 320     # [m3/h]
-ATES_THICKNESS = 55      # [m]
-ATES_KH        = 10      # [m/day]
-ATES_ANI       = 5       # [-]
-ATES_T_GROUND  = 15      # [C]
-ATES_LIFETIME  = 30
+# --- ATES aquifer (Delft) --------------------------------------------------
+ATES_MAX_V     = _DELFT["STORAGE_KW"]["max_V"]      # [m3/h]
+ATES_THICKNESS = _DELFT["STORAGE_KW"]["thickness"]  # [m]
+ATES_KH        = _DELFT["STORAGE_KW"]["kh"]         # [m/day]
+ATES_ANI       = _DELFT["STORAGE_KW"]["ani"]        # [-]
+ATES_T_GROUND  = _DELFT["STORAGE_KW"]["T_ground"]   # [C]
+ATES_LIFETIME  = _DELFT["STORAGE_KW"]["lifetime"]
 
 # --- Heat pump (only used if the config includes the HP) -------------------
-HP_POWER_EL         = 1500   # [kW_el] fixed compressor rating
-HP_DELTA_T_COLDSIDE = 20     # [K] cooling below the DHN return -> fixed cold-well T
+HP_POWER_EL         = _DELFT["HP_POWER_EL"]          # [kW_el] fixed compressor rating
+HP_DELTA_T_COLDSIDE = _DELFT["HP_DELTA_T_COLDSIDE"]  # [K] cooling below the DHN return -> fixed cold-well T
 
 # --- Fuel and CO2 prices for the economics ---------------------------------
-GAS_PRICE = 0.055        # [euro/kWh_gas]
-CO2_PRICE = 150          # [euro/ton]
-ELEC_PRICE = 0.2         # [euro/kWh]
+GAS_PRICE = _DELFT["GAS_PRICE"]            # [euro/kWh_gas]
+CO2_PRICE = _DELFT["CO2_PRICE"]            # [euro/ton]
+ELEC_PRICE = _DELFT["ELEC_PRICE"]          # [euro/kWh]
 
 # ================================================================== #
 
@@ -99,18 +115,71 @@ def _config_from_args(CONFIG, USE_HP):
         return c
     return "GGAH" if USE_HP else "GGA"
 
-# Must match what LCOE_calc_Yang is called with, below.
-DISC_RATE         = 0.05
-LIFETIME_SYSTEM   = 60
-LIFETIME_NETWORK  = 60
-OPEX_NETWORK_PERC = 0.02
-NETWORK_EUR_PER_M = 1157.0
+# Delft defaults; per site they come from the preset and are passed on to
+# LCOE_calc_Yang and _cost_split, so the two always use the same values.
+DISC_RATE         = _DELFT["DISC_RATE"]
+LIFETIME_SYSTEM   = _DELFT["LIFETIME_SYSTEM"]
+LIFETIME_NETWORK  = _DELFT["LIFETIME_NETWORK"]
+OPEX_NETWORK_PERC = _DELFT["OPEX_NETWORK_PERC"]
+NETWORK_EUR_PER_M = _DELFT["NETWORK_EUR_PER_M"]
 # than redeclaring, so the reported ratio_ATES_HP can never drift from the target.
 RHO_CP = 4180.0                  # [kJ/m3.K]
 
+# run_case arguments that a site preset can fill (default None = take the preset).
+_SITE_KEYS = ("STORAGE_TYPE", "DEMAND_EXAMPLE", "DEMAND_T_IN", "DEMAND_T_OUT",
+              "GEO_POWER", "GEO_T_OUT", "GEO_COSTPERKW", "GEO_FIXED_OPEX",
+              "GEO_VAR_OPEX", "GEO_LIFETIME", "GEO_CO2", "GAS_PRICE", "GAS_CO2",
+              "CO2_PRICE", "ELEC_PRICE", "DISC_RATE", "LIFETIME_SYSTEM",
+              "LIFETIME_NETWORK", "NETWORK_LENGTH_M", "NETWORK_EUR_PER_M",
+              "OPEX_NETWORK_PERC", "HP_POWER_EL", "HP_DELTA_T_COLDSIDE", "HP_CAPEX",
+              "HP_FIXED_OPEX", "HP_LIFETIME", "HP_CO2_EL", "STORAGE_ELEC_KWH_PER_M3")
+
+# Legacy ATES_* run_case arguments -> storage-object keyword. max_V, T_ground and
+# lifetime apply to every storage type; the aquifer ones only to the ATES.
+_ATES_ARG_TO_KW = {"ATES_MAX_V": "max_V", "ATES_T_GROUND": "T_ground",
+                   "ATES_LIFETIME": "lifetime", "ATES_THICKNESS": "thickness",
+                   "ATES_KH": "kh", "ATES_ANI": "ani"}
+
+
+def load_site(site):
+    """PARAMS dict of site_config_<site>.py (a copy, safe to modify)."""
+    try:
+        mod = importlib.import_module(f"site_config_{site}")
+    except ModuleNotFoundError as e:
+        raise ValueError(f"No site preset 'site_config_{site}.py' for SITE={site!r}") from e
+    p = dict(mod.PARAMS)
+    p["STORAGE_KW"] = dict(p.get("STORAGE_KW", {}))
+    return p
+
+
+def _build_storage(kind, supplier, hp, storage_kw, elec_price, elec_kWh_per_m3):
+    """
+    Storage object for the site. ATES / MTES / BTES all expose the same
+    interface to main2 (see the MTES_obj_Peter / BTES_obj_Peter docstrings).
+    BTES_obj is imported here, so an ATES or MTES run does not need pygfunction.
+    """
+    kw = dict(storage_kw)
+    if kind == "ATES":
+        S = ATES_obj(supplier, HP=hp, elec_price=elec_price, **kw)
+    elif kind == "MTES":
+        from MTES_obj_Peter import MTES_obj
+        S = MTES_obj(supplier, HP=hp, elec_price=elec_price, **kw)
+    elif kind == "BTES":
+        from BTES_obj_Peter import BTES_obj
+        S = BTES_obj(supplier, HP=hp, elec_price=elec_price, **kw)
+    else:
+        raise ValueError(f"STORAGE_TYPE must be ATES / MTES / BTES, got {kind!r}")
+    # Read by main2.economic_analysis (David's pumping OPEX formula).
+    S.elec_kWh_per_m3 = elec_kWh_per_m3
+    # Read by main2.system(): the HP charging-volume factor needs a cold well,
+    # which only the ATES has. MTES / BTES are closed loops -> factor 1.
+    S.charge_factor_HP = (kind == "ATES")
+    return S
+
 
 def _cost_split(result, df_eco, supply, co2_df, generated_disc, capex_network,
-                hp_co2_eur):
+                hp_co2_eur, disc_rate=DISC_RATE, lifetime_system=LIFETIME_SYSTEM,
+                lifetime_network=LIFETIME_NETWORK, opex_network_perc=OPEX_NETWORK_PERC):
     """
     Additive decomposition of the LCOE_calc_Yang system LCOH into [EUR/MWh].
 
@@ -128,12 +197,12 @@ def _cost_split(result, df_eco, supply, co2_df, generated_disc, capex_network,
     if not generated_disc or not np.isfinite(generated_disc) or generated_disc <= 0:
         return {}
 
-    r = DISC_RATE
-    af = sum(1.0 / (1.0 + r) ** j for j in range(LIFETIME_SYSTEM))
+    r = disc_rate
+    af = sum(1.0 / (1.0 + r) ** j for j in range(lifetime_system))
 
     def _cap(capex, lifetime):
         return sum(capex / (1.0 + r) ** j
-                   for j in range(0, LIFETIME_SYSTEM, max(int(lifetime), 1)))
+                   for j in range(0, lifetime_system, max(int(lifetime), 1)))
 
     def _val(name, col):
         if col not in df_eco.columns or name not in df_eco.index:
@@ -145,6 +214,9 @@ def _cost_split(result, df_eco, supply, co2_df, generated_disc, capex_network,
             return 0.0
         return float(np.nan_to_num(co2_df.at[name, "Cost_CO2"]))
 
+    # Storage segment label: "ATES well" (as in the Delft figures), "MTES well", "BTES well".
+    stor_seg = next((s.name + " well" for s in supply if s.control == "storage"), "ATES well")
+
     seg, co2_geo = {}, 0.0
     for i in supply:
         nm = i.name
@@ -152,16 +224,16 @@ def _cost_split(result, df_eco, supply, co2_df, generated_disc, capex_network,
             continue
         capex, opex, co2 = _val(nm, "capex"), _val(nm, "opex"), _co2(nm)
 
-        if nm == "ATES":
+        if i.control == "storage":
             # A NaN LCOE means LCOE_calc skipped it (nothing extracted), and
             # LCOE_calc_Yang skipped it too -> no cost in the system figure.
             if not np.isfinite(_val(nm, "LCOE")):
                 continue
             hp_cap, hp_el = _val(nm, "hp_capex"), _val(nm, "hp_elec_cost")
             hp_fix = _val(nm, "hp_fixopex")
-            seg["ATES well"] = (seg.get("ATES well", 0.0)
-                                + _cap(capex - hp_cap, i.lifetime)
-                                + (opex - co2 - hp_el - hp_fix) * af)
+            seg[stor_seg] = (seg.get(stor_seg, 0.0)
+                             + _cap(capex - hp_cap, i.lifetime)
+                             + (opex - co2 - hp_el - hp_fix) * af)
             if hp_cap or hp_el:
                 seg["HP capex"] = _cap(hp_cap, i.lifetime)
                 seg["HP opex (elec + fixed)"] = (hp_el + hp_fix) * af
@@ -179,7 +251,7 @@ def _cost_split(result, df_eco, supply, co2_df, generated_disc, capex_network,
                       if pct in result and prod in result else 0.0)
             to_ates = getattr(i, "var_opex", 0.0) * stored
             seg["Geothermal"] = _cap(capex, i.lifetime) + (opex - co2 - to_ates) * af
-            seg["ATES well"] = seg.get("ATES well", 0.0) + to_ates * af
+            seg[stor_seg] = seg.get(stor_seg, 0.0) + to_ates * af
             co2_geo += co2
         elif nm == "Gas boiler":
             seg["Gas boiler"] = _cap(capex, i.lifetime) + (opex - co2) * af
@@ -190,28 +262,40 @@ def _cost_split(result, df_eco, supply, co2_df, generated_disc, capex_network,
         seg["CO2 - geothermal"] = co2_geo * af
 
     if capex_network:
-        seg["Network"] = (len(range(0, LIFETIME_SYSTEM, LIFETIME_NETWORK))
+        seg["Network"] = (len(range(0, lifetime_system, lifetime_network))
                           * capex_network
-                          + LIFETIME_SYSTEM * OPEX_NETWORK_PERC * capex_network)
+                          + lifetime_system * opex_network_perc * capex_network)
 
     return {k: v / generated_disc * 1000.0 for k, v in seg.items()}
 
-def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
-             DEMAND_EXAMPLE=DEMAND_EXAMPLE, DEMAND_T_IN=DEMAND_T_IN, DEMAND_T_OUT=DEMAND_T_OUT,
-             GEO_POWER=GEO_POWER, GEO_T_OUT=GEO_T_OUT,
-             ATES_MAX_V=ATES_MAX_V, ATES_THICKNESS=ATES_THICKNESS, ATES_KH=ATES_KH,
-             ATES_ANI=ATES_ANI, ATES_T_GROUND=ATES_T_GROUND,
-             ATES_LIFETIME=ATES_LIFETIME,
-             HP_POWER_EL=HP_POWER_EL, HP_DELTA_T_COLDSIDE=HP_DELTA_T_COLDSIDE,
+def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP, SITE=SITE,
+             STORAGE_TYPE=None, STORAGE_KW=None, STORAGE_ELEC_KWH_PER_M3=None,
+             DEMAND_EXAMPLE=None, DEMAND_T_IN=None, DEMAND_T_OUT=None,
+             GEO_POWER=None, GEO_T_OUT=None, GEO_COSTPERKW=None, GEO_FIXED_OPEX=None,
+             GEO_VAR_OPEX=None, GEO_LIFETIME=None, GEO_CO2=None,
+             ATES_MAX_V=None, ATES_THICKNESS=None, ATES_KH=None,
+             ATES_ANI=None, ATES_T_GROUND=None,
+             ATES_LIFETIME=None,
+             HP_POWER_EL=None, HP_DELTA_T_COLDSIDE=None, HP_CAPEX=None,
+             HP_FIXED_OPEX=None, HP_LIFETIME=None, HP_CO2_EL=None,
              HP_DYNAMIC_DISPATCH=False, HP_THRESHOLD_EUR_MWH=60.0,
-             GAS_PRICE=GAS_PRICE, CO2_PRICE=CO2_PRICE, ELEC_PRICE=ELEC_PRICE, NETWORK_LENGTH_M=0.0,
+             GAS_PRICE=None, GAS_CO2=None, CO2_PRICE=None, ELEC_PRICE=None,
+             DISC_RATE=None, LIFETIME_SYSTEM=None, LIFETIME_NETWORK=None,
+             NETWORK_LENGTH_M=None, NETWORK_EUR_PER_M=None, OPEX_NETWORK_PERC=None,
              OUTFILE=None, tag="",
              make_plots=False, write_excel=True):
     """
     Run one configuration. Any argument left at its default reproduces the
     single-run config; a sweep passes only the knobs it varies.
 
+    SITE        : "Delft" / "Bochum" / "Darmstadt" -> preset site_config_<SITE>.py.
+                  Every site argument left at None is taken from that preset.
+    STORAGE_KW  : dict of extra storage-object keywords, merged over the preset's
+                  STORAGE_KW (e.g. {"N_boreholes": 19} for the BTES).
+    ATES_*      : legacy names. ATES_MAX_V / ATES_T_GROUND / ATES_LIFETIME set
+                  max_V / T_ground / lifetime of ANY storage type.
     CONFIG      : "G" / "GG" / "GGA" / "GGAH". If None, derived from USE_HP.
+                  "A" = the site's storage (ATES, MTES or BTES).
     OUTFILE     : Excel path. None -> auto 'timeseries_<CONFIG>[_tag].xlsx'.
     tag         : suffix on the auto filename so sweep runs don't overwrite.
     make_plots  : show the two system_plot figures (keep False in a sweep).
@@ -219,40 +303,75 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
 
     Returns a dict of headline results so a sweep can collect rows.
     """
+    _args = dict(locals())
     cfg = _config_from_args(CONFIG, USE_HP)
     use_geo  = cfg in ("GG", "GGA", "GGAH")
-    use_ates = cfg in ("GGA", "GGAH")
+    use_ates = cfg in ("GGA", "GGAH")      # "ates" = the site's storage
     use_hp   = cfg == "GGAH"
 
+    # --- Resolve parameters: argument > site preset > object default ----------
+    p = load_site(SITE)
+    p.update({k: _args[k] for k in _SITE_KEYS if _args.get(k) is not None})
+    storage_kw = p["STORAGE_KW"]
+    for arg, kw in _ATES_ARG_TO_KW.items():
+        if _args[arg] is not None:
+            storage_kw[kw] = _args[arg]
+    if STORAGE_KW:
+        storage_kw.update(STORAGE_KW)
+    storage_type = p["STORAGE_TYPE"]
+
+    DEMAND_EXAMPLE, DEMAND_T_IN, DEMAND_T_OUT = (p["DEMAND_EXAMPLE"], p["DEMAND_T_IN"],
+                                                 p["DEMAND_T_OUT"])
+    GEO_POWER, GEO_T_OUT = p["GEO_POWER"], p["GEO_T_OUT"]
+    HP_POWER_EL, HP_DELTA_T_COLDSIDE = p["HP_POWER_EL"], p["HP_DELTA_T_COLDSIDE"]
+    GAS_PRICE, CO2_PRICE, ELEC_PRICE = p["GAS_PRICE"], p["CO2_PRICE"], p["ELEC_PRICE"]
+    NETWORK_LENGTH_M = p["NETWORK_LENGTH_M"]
+
+    # No dynamic pricing outside Delft: the dispatch signal and Eq. 2 use NL
+    # day-ahead prices and Stedin/NL tariffs.
+    if HP_DYNAMIC_DISPATCH and storage_type != "ATES":
+        raise ValueError(f"HP_DYNAMIC_DISPATCH is only set up for the Delft ATES "
+                         f"(NL prices); {SITE} / {storage_type} uses the flat ELEC_PRICE.")
+
     # --- Output filename (auto-suffixed by config) -----------------------------
-    # A bare filename (auto-generated or passed in) is placed in RESULTS_DIR.
+    # A bare filename (auto-generated or passed in) is placed in RESULTS_DIR
+    # (Delft) or RESULTS_DIR/<SITE> (other sites).
     # An absolute path, or one that already carries a directory, is left alone.
+    results_dir = RESULTS_DIR if SITE == "Delft" else os.path.join(RESULTS_DIR, SITE)
     if OUTFILE is None:
         OUTFILE = f"timeseries_{cfg}{('_' + tag) if tag else ''}.xlsx"
     if not os.path.isabs(OUTFILE) and not os.path.dirname(OUTFILE):
-        OUTFILE = os.path.join(RESULTS_DIR, OUTFILE)
+        OUTFILE = os.path.join(results_dir, OUTFILE)
 
     timestep = TIMESTEP
 
     # --- District-heating components ------------------------------------------
     demand = demand_class(T_in=DEMAND_T_IN, T_out=DEMAND_T_OUT,
                           example_demand=DEMAND_EXAMPLE)
-    gas    = gas_boiler(gas_price=GAS_PRICE)
+    gas    = gas_boiler(gas_price=GAS_PRICE, CO2_kg=p["GAS_CO2"])
 
-    # Geothermal is present in GG / GGA / GGAH (charging source for the ATES too).
-    geo = geothermal(power=GEO_POWER, T_out=GEO_T_OUT) if use_geo else None
+    # Geothermal is present in GG / GGA / GGAH (charging source for the storage too).
+    # Bochum / Darmstadt: zero CAPEX / fixed OPEX, heat bought via var_opex.
+    geo = (geothermal(power=GEO_POWER, T_out=GEO_T_OUT, costperkW=p["GEO_COSTPERKW"],
+                      fixed_opex=p["GEO_FIXED_OPEX"], var_opex=p["GEO_VAR_OPEX"],
+                      lifetime=p["GEO_LIFETIME"], CO2_kg=p["GEO_CO2"])
+           if use_geo else None)
 
     # Heat pump only in GGAH.
-    hp = (heat_pump_ATES(power_el=HP_POWER_EL, delta_T_coldside=HP_DELTA_T_COLDSIDE, elec_price=ELEC_PRICE)
+    hp = (heat_pump_ATES(power_el=HP_POWER_EL, delta_T_coldside=HP_DELTA_T_COLDSIDE,
+                         costperkW=p["HP_CAPEX"], fixed_opex=p["HP_FIXED_OPEX"],
+                         elec_price=ELEC_PRICE, lifetime=p["HP_LIFETIME"],
+                         CO2_kg_el=p["HP_CO2_EL"])
           if use_hp else None)
 
-    # ATES only in GGA / GGAH; it charges from the geothermal supplier.
+    # Storage only in GGA / GGAH; it charges from the geothermal supplier.
+    # Variable kept as ATES (small diff); it is the site's storage object.
     if use_ates:
-        ATES = ATES_obj([geo], max_V=ATES_MAX_V, thickness=ATES_THICKNESS,
-                        kh=ATES_KH, ani=ATES_ANI, T_ground=ATES_T_GROUND,
-                        lifetime=ATES_LIFETIME, HP=hp, elec_price=ELEC_PRICE)
+        ATES = _build_storage(storage_type, [geo], hp, storage_kw, ELEC_PRICE,
+                              p["STORAGE_ELEC_KWH_PER_M3"])
     else:
         ATES = None
+    sname = ATES.name if ATES is not None else storage_type   # result column prefix
 
     # Preferred order: sustainable source, storage, back-up. Only include the
     # components that exist for this config.
@@ -279,14 +398,16 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         system_plot(result, supply, demand, len_timestep=timestep, setting="ordered")
 
     # --- Economics (LCOH per component) ----------------------------------------
-    df_eco = economic_analysis(result, supply, disc_rate=DISC_RATE,
+    # Site economics (resolved above); _cost_split below gets the same values.
+    eco_kw = dict(disc_rate=p["DISC_RATE"], lifetime_system=p["LIFETIME_SYSTEM"],
+                  lifetime_network=p["LIFETIME_NETWORK"],
+                  opex_network_perc=p["OPEX_NETWORK_PERC"])
+    df_eco = economic_analysis(result, supply, disc_rate=eco_kw["disc_rate"],
                                incorporate_CO2=True, CO2_price=CO2_PRICE,
                                len_timestep=timestep)
-    capex_network_eur = NETWORK_LENGTH_M * NETWORK_EUR_PER_M
+    capex_network_eur = NETWORK_LENGTH_M * p["NETWORK_EUR_PER_M"]
     system_lcoh_yang, generated_disc = LCOE_calc_Yang(
-        result, supply, df_eco, disc_rate=DISC_RATE,
-        lifetime_system=LIFETIME_SYSTEM, capex_network=capex_network_eur,
-        opex_network_perc=OPEX_NETWORK_PERC, lifetime_network=LIFETIME_NETWORK)
+        result, supply, df_eco, capex_network=capex_network_eur, **eco_kw)
     print("\nLCOH per component:")
     for i in range(len(df_eco)):
         print(f"  {df_eco.iloc[i, 0]:<16} = {round(df_eco.iloc[i].loc['LCOE'], 3)} euro/kWh")
@@ -318,8 +439,8 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     print(f"\nConfig {cfg} summary:")
     print(f"  HP condenser (Q_evap+P_el)      : {np.nansum(_arr('output_HP')) / GWh:8.3f} GWh")
     print(f"  HP electricity  (P_el)          : {np.nansum(_arr('P_el')) / GWh:8.3f} GWh")
-    ates_prod_col = _col("ATES production")
-    print(f"  ATES subsystem (direct+HP)      : {ates_prod_col.sum() / GWh:8.3f} GWh")
+    ates_prod_col = _col(sname + " production")
+    print(f"  {sname} subsystem (direct+HP)      : {ates_prod_col.sum() / GWh:8.3f} GWh")
     print(f"  Total heat to demand            : {_col('Total production').sum() / GWh:8.3f} GWh")
     if mode.size:
         print(f"  discharge hours -> mode A/B/D   : "
@@ -330,9 +451,9 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     # --- Timeseries build: per-source heat + HP/ATES diagnostics ---------------
     hp_ts = result["Heat pump production"] if "Heat pump production" in result \
             else pd.Series(0.0, index=result.index)
-    # "ATES corrected" includes HP condenser heat -> strip it for the HX-only part.
-    if "ATES corrected" in result:
-        ates_direct = result["ATES corrected"] - hp_ts
+    # "<storage> corrected" includes HP condenser heat -> strip it for the HX-only part.
+    if sname + " corrected" in result:
+        ates_direct = result[sname + " corrected"] - hp_ts
     else:
         ates_direct = pd.Series(0.0, index=result.index)
 
@@ -360,7 +481,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
             if c_pct in result and c_prod in result:
                 charge_kWh += np.nan_to_num((result[c_pct] * result[c_prod]).values)
 
-    ates_prod = _col("ATES production")
+    ates_prod = _col(sname + " production")
     with np.errstate(divide="ignore", invalid="ignore"):
         cop_check = np.where(P_el > 0, out_HP / P_el, np.nan)
 
@@ -375,8 +496,8 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         "Demand [kWh]": result["Demand"].values,
         "Geothermal [kWh]": geo_corr,
         "Geothermal to demand [kWh]": geo_corr - charge_kWh,
-        "ATES direct [kWh]": ates_dir_corr,
-        "ATES direct split [kWh]": out_dir,
+        f"{sname} direct [kWh]": ates_dir_corr,
+        f"{sname} direct split [kWh]": out_dir,
         "Heat pump [kWh]": hp_corr,
         "Gas boiler [kWh]": gas_corr,
         "Sum sources [kWh]": sum_src,
@@ -389,11 +510,11 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         "P_el compressor [kWh]": P_el,
         "HP condenser [kWh]": out_HP,
         "HP identity resid [kWh]": out_HP - (out_evap + P_el),
-        "ATES production [kWh]": ates_prod,
+        f"{sname} production [kWh]": ates_prod,
         "Split sum [kWh]": out_dir + out_evap + P_el,
         "Split residual [kWh]": (out_dir + out_evap + P_el) - ates_prod,
         "Flow extracted [m3]": flow_ext,
-        "Charge to ATES [kWh]": charge_kWh,
+        f"Charge to {sname} [kWh]": charge_kWh,
         "Charge volume [m3]": flow_inj,
     })
 
@@ -402,9 +523,9 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         return float(np.nansum(x))
 
     check_defs = [
-        ("Split sum vs ATES production",
+        (f"Split sum vs {sname} production",
          out_dir + out_evap + P_el, ates_prod, True,
-         "Energy balance on the ATES subsystem (direct HX + HP condenser)."),
+         f"Energy balance on the {sname} subsystem (direct HX + HP condenser)."),
         ("HP condenser vs evap + P_el",
          out_HP, out_evap + P_el, True,
          "First law on the heat pump (per-hour = 'HP identity resid' column)."),
@@ -421,7 +542,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
          (geo_corr - charge_kWh) + ates_dir_corr + hp_corr + gas_corr,
          result["Demand"].values, True,
          "Sources-to-demand (geo charging removed) vs demand; residual = unmet demand. Geo production directly going to Demand included(should be ~0)."),
-        ("ATES direct: corrected vs raw split",
+        (f"{sname} direct: corrected vs raw split",
          ates_dir_corr, out_dir, False,
          "INFO, not zero: system() demand-clipping vs raw _energy_split output."),
         ("'HP identity resid' column sum",
@@ -500,7 +621,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         except Exception:
             hp_co2_eur = 0.0
     cost_split = _cost_split(result, df_eco, supply, co2_df, generated_disc,
-                             capex_network_eur, hp_co2_eur)
+                             capex_network_eur, hp_co2_eur, **eco_kw)
     if cost_split:
         print(f"  cost split residual: "
               f"{sum(cost_split.values()) - system_lcoh_yang * 1000.0:+.4f} "
@@ -527,7 +648,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     # addition. Do not sum the column with this row included (it would double-count).
     if hp_obj is not None:
         hp_row = pd.DataFrame([{
-            "Component": "Heat pump (in ATES)",
+            "Component": f"Heat pump (in {sname})",
             "CAPEX [Meuro]": hp_capex_eur / 1e6,
             "OPEX (incl. CO2) [Meuro/yr]": (hp_elec_cost + hp_fixopex_eur) / 1e6,
             "Generated discounted [GWh]": np.nan,
@@ -543,7 +664,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     summary_tbl = pd.DataFrame({
         "Metric": [
             "Config",
-            "System LCOH (Yang, 60-yr horizon) [euro/kWh]",
+            f"System LCOH (Yang, {p['LIFETIME_SYSTEM']}-yr horizon) [euro/kWh]",
             "Total CO2 [t/yr]",
             "Total CO2 cost [euro/yr]",
             "HP rated power [kW]",
@@ -552,8 +673,8 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
             "HP mean price paid [euro/kWh]",
             "HP electricity cost [euro/yr]",
             "HP electricity cost at flat price [euro/yr]",
-            "HP CAPEX [Meuro]  (already inside ATES)",
-            "HP fixed OPEX [euro/yr]  (already inside ATES)",
+            f"HP CAPEX [Meuro]  (already inside {sname})",
+            f"HP fixed OPEX [euro/yr]  (already inside {sname})",
             "HP mean COP (running)",
         ],
         "Value": [
@@ -577,24 +698,24 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         "Variable": [
             "Time (hours)", "Demand [kWh]", "Geothermal [kWh]",
             "Geothermal to demand [kWh]",
-            "ATES direct [kWh]", "ATES direct split [kWh]", "Heat pump [kWh]",
+            f"{sname} direct [kWh]", f"{sname} direct split [kWh]", "Heat pump [kWh]",
             "Gas boiler [kWh]", "Sum sources [kWh]", "Mode", "T_extract [C]",
             "T_inject [C]", "COP [-]", "COP from HP/P_el [-]",
             "HP evap/source [kWh]", "P_el compressor [kWh]", "HP condenser [kWh]",
-            "HP identity resid [kWh]", "ATES production [kWh]", "Split sum [kWh]",
-            "Split residual [kWh]", "Flow extracted [m3]", "Charge to ATES [kWh]",
+            "HP identity resid [kWh]", f"{sname} production [kWh]", "Split sum [kWh]",
+            "Split residual [kWh]", "Flow extracted [m3]", f"Charge to {sname} [kWh]",
             "Charge volume [m3]",
         ],
         "Description": [
             "Hour of the year (simulation timestamp).",
             "DHN heat demand in this hour.",
             "Geothermal heat delivered to demand (corrected, demand-clipped).",
-            "Geothermal heat that went straight to demand, excluding heat routed into ATES charging (= 'Geothermal [kWh]' minus 'Charge to ATES [kWh]').",
-            "ATES direct-HX heat to demand from system() (demand-clipped, HP heat removed).",
-            "Raw direct-HX heat (output_dir) from _energy_split, before system clipping. Compare with 'ATES direct [kWh]'.",
+            f"Geothermal heat that went straight to demand, excluding heat routed into {sname} charging (= 'Geothermal [kWh]' minus 'Charge to {sname} [kWh]').",
+            f"{sname} direct-HX heat to demand from system() (demand-clipped, HP heat removed).",
+            f"Raw direct-HX heat (output_dir) from _energy_split, before system clipping. Compare with '{sname} direct [kWh]'.",
             "HP condenser heat delivered to demand this hour (= evap + P_el).",
             "Back-up gas-boiler heat to demand.",
-            "Geothermal + ATES direct + Heat pump + Gas boiler. Should reconstruct Demand on covered hours.",
+            f"Geothermal + {sname} direct + Heat pump + Gas boiler. Should reconstruct Demand on covered hours.",
             "Dispatch state: off (no discharge), A (HX only, HP idle), B (HP on, T_extract above return), D (HP on, T_extract below return).",
             "Mean hot-well extraction temperature this hour.",
             "Realized cold-well reinjection temperature: T_return (HP off) or T_floor (HP active).",
@@ -604,9 +725,9 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
             "Electricity consumed by the compressor.",
             "Total heat leaving the HP condenser (Q_evap + P_el).",
             "HP condenser - (evap + P_el). First law on the HP; should be ~0.",
-            "Total ATES-subsystem heat (direct HX + HP condenser), raw from calc_heat.",
-            "output_dir + output_evap + P_el. Should equal ATES production.",
-            "Split sum - ATES production. Energy balance on the ATES; should be ~0.",
+            f"Total {sname}-subsystem heat (direct HX + HP condenser), raw from calc_heat.",
+            f"output_dir + output_evap + P_el. Should equal {sname} production.",
+            f"Split sum - {sname} production. Energy balance on the {sname}; should be ~0.",
             "Volume drawn from the hot well this hour.",
             "Heat charged into storage this hour, summed over storage suppliers.",
             "Volume injected into storage this hour (flow_injected).",
@@ -622,7 +743,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
                 "Parameter": [
                     "Configuration (CONFIG)",
                     "DHN supply T_in [C]", "DHN return T_out [C]",
-                    "ATES T_return / HX floor [C]", "ATES T_floor / HP cold side [C]",
+                    f"{sname} T_return / HX floor [C]", f"{sname} T_floor / HP cold side [C]",
                     "Ground temp T_g [C]", "Recovery efficiency Reff [-]",
                     "Annual injected volume [m3]", "max_V [m3/h]",
                     "HP power_el [kW]", "HP delta_T_coldside [K]",
@@ -683,16 +804,18 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         for col in (i.name + " production", i.name + " corrected"):
             if col in result:
                 totals[col] = result[col].sum() / GWh
-    totals["ATES direct only"] = ates_dir_corr.sum() / GWh
+    totals[f"{sname} direct only"] = ates_dir_corr.sum() / GWh
     totals["Unmet (Demand-Total, clipped)"] = \
         np.clip(result["Demand"] - result["Total production"], 0, None).sum() / GWh
     for k, v in totals.items():
         print(f"  {k:<30}: {v:>10.4f}")
 
     print("-" * 64)
-    print(f"  {'ATES Reff':<30}: {(getattr(ATES, 'Reff', np.nan) if ATES is not None else np.nan):>10.4f}")
-    print(f"  {'ATES injected volume [m3]':<30}: {float(getattr(ATES, 'volume', np.nan) if ATES is not None else np.nan):>14,.1f}")
-    print(f"  {'ATES extracted volume [m3]':<30}: {float(np.nansum(flow_ext)):>14,.1f}")
+    print(f"  {sname + ' Reff':<30}: {(getattr(ATES, 'Reff', np.nan) if ATES is not None else np.nan):>10.4f}")
+    if ATES is not None and storage_type != "ATES":
+        print(f"  {sname + ' utilisation':<30}: {float(getattr(ATES, 'utilisation', np.nan)):>10.4f}")
+    print(f"  {sname + ' injected volume [m3]':<30}: {float(getattr(ATES, 'volume', np.nan) if ATES is not None else np.nan):>14,.1f}")
+    print(f"  {sname + ' extracted volume [m3]':<30}: {float(np.nansum(flow_ext)):>14,.1f}")
     print("-" * 64)
     print("  Heat-pump specifics")
     print(f"  {'HP condenser heat [GWh]':<30}: {out_HP.sum() / GWh:>10.4f}")
@@ -707,7 +830,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     if hp_breakdown:
         for k, v in hp_breakdown.items():
             print(f"    {k:<28}: {v:>14,.0f}")
-    print(f"  {'HP CAPEX [euro] (in ATES)':<30}: {hp_capex_eur:>14,.0f}")
+    print(f"  {'HP CAPEX [euro] (in ' + sname + ')':<30}: {hp_capex_eur:>14,.0f}")
     a_b_d = (int((mode == 'A').sum()), int((mode == 'B').sum()), int((mode == 'D').sum())) \
         if mode.size else (0, 0, 0)
     print(f"  {'discharge hours A/B/D':<30}: {a_b_d[0]:>4} / {a_b_d[1]} / {a_b_d[2]}")
@@ -715,7 +838,7 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
 
     print("\nEconomic analysis:")
     print(df_eco.to_string())
-    print(f"\n  System LCOH (Yang, 60-yr)         : {system_lcoh_yang:.4f} euro/kWh")
+    print(f"\n  System LCOH (Yang, {p['LIFETIME_SYSTEM']}-yr)         : {system_lcoh_yang:.4f} euro/kWh")
     if co2_df is not None:
         print(f"  Total CO2                         : "
               f"{co2_df['CO2_emission [kg]'].sum() / 1000:,.1f} t/yr "
@@ -731,27 +854,38 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
     demand_GWh   = result["Demand"].sum() / GWh
     gd_ratio = (geo_prod_GWh / demand_GWh) if demand_GWh > 0 else np.nan
 
-    # --- ATES nominal thermal capacity vs HP electrical rating -----------------
+    # --- Storage nominal thermal capacity vs HP electrical rating --------------
     # ates_nominal = flow x rho*cp x (T_geo_supply - T_DHN_return): peak direct-HX
     # power of a freshly-charged well (charged to the geo supply temperature,
     # delivering down to the DHN return). Compared against the HP electrical
-    # rating -> a fixed, COP-independent sizing metric.
+    # rating -> a fixed, COP-independent sizing metric. Uses the object's max_V,
+    # because the BTES derives it from the number of boreholes.
+    storage_max_V = ATES.max_V if ATES is not None else np.nan
     if use_ates:
-        ates_nominal_kW = (ATES_MAX_V / 3600.0) * RHO_CP * (GEO_T_OUT - DEMAND_T_OUT)
+        ates_nominal_kW = (storage_max_V / 3600.0) * RHO_CP * (GEO_T_OUT - DEMAND_T_OUT)
     else:
         ates_nominal_kW = np.nan
     ratio_ATES_HP = (ates_nominal_kW / HP_POWER_EL) if use_hp else np.nan
+    storage_lcoh = df_eco.at[sname, "LCOE"] if sname in df_eco.index else np.nan
 
     # --- Return headline results so a sweep can collect rows -------------------
+    # The ates_* / ATES_* keys are kept for the Delft Case scripts; they describe
+    # the site's storage, whatever its type. storage_* are the same numbers.
     return {
         "config": cfg,
         "USE_HP": use_hp,
         "tag": tag,
+        "site": SITE,
+        "storage_type": storage_type if use_ates else None,
         "outfile": OUTFILE if write_excel else None,
         "GEO_POWER": GEO_POWER if use_geo else 0.0,
         "GD_ratio": gd_ratio,
-        "ATES_MAX_V": ATES_MAX_V if use_ates else np.nan,
-        "ATES_LIFETIME": ATES_LIFETIME if use_ates else np.nan,
+        "ATES_MAX_V": storage_max_V if use_ates else np.nan,
+        "ATES_LIFETIME": ATES.lifetime if use_ates else np.nan,
+        "storage_max_V": storage_max_V if use_ates else np.nan,
+        "storage_lifetime": ATES.lifetime if use_ates else np.nan,
+        "storage_utilisation": float(getattr(ATES, "utilisation", np.nan)) if ATES is not None else np.nan,
+        "storage_yearly_Reff": getattr(ATES, "yearly_Reff", None) if ATES is not None else None,
         "HP_POWER_EL": HP_POWER_EL if use_hp else np.nan,
         "HP_DELTA_T_COLDSIDE": HP_DELTA_T_COLDSIDE if use_hp else np.nan,
         "dynamic_dispatch": bool(HP_DYNAMIC_DISPATCH and use_hp),
@@ -772,7 +906,9 @@ def run_case(USE_HP=USE_HP, CONFIG=CONFIG, TIMESTEP=TIMESTEP,
         "system_lcoh_yang": system_lcoh_yang,
         "cost_split": cost_split,
         "geo_lcoh": df_eco.at["Geothermal well", "LCOE"] if "Geothermal well" in df_eco.index else np.nan,
-        "ates_lcoh": df_eco.at["ATES", "LCOE"] if "ATES" in df_eco.index else np.nan,
+        "ates_lcoh": storage_lcoh,
+        "storage_lcoh": storage_lcoh,
+        "storage_direct_GWh": ates_dir_corr.sum() / GWh,
         "gas_lcoh": df_eco.at["Gas boiler", "LCOE"] if "Gas boiler" in df_eco.index else np.nan,
         "hp_elec_GWh": P_el_total_kWh / GWh,
         "hp_elec_cost_eur": hp_elec_cost,

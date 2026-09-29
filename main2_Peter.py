@@ -389,7 +389,8 @@ class heat_pump_ATES:
         self.elec_input  = None
 
     def init(self, ATES):
-        if ATES.name != 'ATES':
+        # Any storage object (ATES / MTES / BTES) can carry the HP.
+        if ATES.control != 'storage':
             raise ValueError("Heat pump connected to wrong storage type")
 
     def Calculate_COP(self, Tsink, Tsource):
@@ -888,6 +889,11 @@ def system(demand, supply, len_timestep = 3600, time_horizon=8760, control = Non
                 # Charging works from the FIXED cold-well temperature up to the supply
                 # temperature; larger delta -> less water needed for the same heat.
                 Factor_due_HP = (i.T_out - T_cold) / (i.T_out - demand.T_out) #? Adapt later to actual losses! Also adapt plotting at comment here: Changeplothere
+                # Closed-loop storage (MTES / BTES) has no cold well: the charge water
+                # is heated from the tank / wall temperature, which calc_heat already
+                # tracks. The driver sets charge_factor_HP = False on those objects.
+                if not getattr(storage_obj, "charge_factor_HP", True):
+                    Factor_due_HP = 1
             else:
                 Factor_due_HP=1
                 
@@ -1092,12 +1098,12 @@ def LCOE_calc_Yang(result,supply,df_eco,disc_rate=0.05,lifetime_system = 60,cape
     generated = 0
     sum_cost=0
     for i in supply:
-        # If name is ATES, do special calculations
-        if i.name == "ATES":
-            
+        # If storage (ATES / MTES / BTES), do special calculations
+        if i.control == "storage":
+
             # Initialize para to 0
 
-            real_extracted = sum(result["ATES corrected"])
+            real_extracted = sum(result[i.name + " corrected"])
             if real_extracted == 0:
                 continue
             max_extracted = i.total_heat_extracted_vs_T_ground_kWh_first_8_years[-1]
@@ -1232,13 +1238,13 @@ def LCOE_calc(result, supply, df_eco,disc_rate=0.05):
     add_opex_ATES=0
     # Loop over supply technologies
     for i in supply:
-        # If name is ATES, do special calculations
-        if i.name == "ATES":
-            
+        # If storage (ATES / MTES / BTES), do special calculations
+        if i.control == "storage":
+
             # Initialize para to 0
             generated = 0
             sum_cost=0
-            real_extracted = sum(result["ATES corrected"])
+            real_extracted = sum(result[i.name + " corrected"])
             if real_extracted == 0:
                 continue
             max_extracted = i.total_heat_extracted_vs_T_ground_kWh_first_8_years[-1] #P: check what exactly this does; is this affected by the implementation of the HP?
@@ -1350,10 +1356,14 @@ def economic_analysis(results_system, supply,disc_rate = 0.05,incorporate_CO2=Fa
     for count, i in enumerate(supply):
         hp_capex = 0
         opex_ATES_fixed = True #P: Done to get same results as David
-        if i.name == "ATES":
+        if i.control == "storage":
             if opex_ATES_fixed:
                 try:
-                    df_eco.loc[i.name,"opex"]=i.fix_opex+(i.volume+sum(i.flow_extracted))/2/1000000*1389*1000*i.elec_price
+                    #P: Check later, implement proper opex costs
+                    # David's ATES pumping formula for every storage; only the electricity
+                    # use per m3 is per technology (ATES 1.389 kWh/m3, set on MTES/BTES by the driver).
+                    elec_kWh_per_m3 = getattr(i, "elec_kWh_per_m3", 1.389)
+                    df_eco.loc[i.name,"opex"]=i.fix_opex+(i.volume+sum(i.flow_extracted))/2*elec_kWh_per_m3*i.elec_price
                 except:
                     df_eco.loc[i.name,"opex"] = 0
             else:
